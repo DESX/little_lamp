@@ -1,0 +1,11 @@
+# Partition table — Zigbee needs more NVS than the default layout provides,
+# and we add a dedicated `zb_storage` partition for the Zigbee stack to
+# persist its network parameters and binding tables across reboots.
+#
+# Name,    Type, SubType,  Offset,   Size,    Flags
+nvs,       data, nvs,      ,         24K,
+otadata,   data, ota,      ,         8K,
+phy_init,  data, phy,      ,         4K,
+factory,   app,  factory,  ,         1500K,
+zb_storage,data, fat,      ,         16K,
+zb_fct,    data, fat,      ,         1K,

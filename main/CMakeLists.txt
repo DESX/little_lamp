@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "schedule.c"
+        "state.c"
+        "bulb.c"
+        "button.c"
+        "commissioning.c"
+        "rtc.c"
+        "console.c"
+        "log.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        nvs_flash
+        esp_driver_uart
+        driver
+        console
+        vfs
+)

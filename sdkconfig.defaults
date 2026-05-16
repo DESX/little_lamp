@@ -1,0 +1,35 @@
+# Baseline configuration. Overrides ESP-IDF defaults.
+# Changing values here? Run `make clean && make build`.
+
+# Target
+CONFIG_IDF_TARGET="esp32c6"
+
+# Zigbee — coordinator role (forms its own network)
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
+CONFIG_ZB_RADIO_NATIVE=y
+
+# NVS — needed for Zigbee binding/key storage
+CONFIG_NVS_ENCRYPTION=n
+
+# Logging — keep our logs on USB serial (built-in USB-Serial-JTAG on the C6).
+# Default level is WARN so the device looks quiet; main.c re-raises the
+# "lamp" tag to INFO at runtime when NVS-stored verbose mode = 1.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+
+# Main task — give it room for the Zigbee stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Power — never sleep the radio while we're a coordinator
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=n
+
+# Watchdog — 30s gives Zigbee init plenty of room
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# Custom partition table (see partitions.csv) — Zigbee needs its own storage
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
