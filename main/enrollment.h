@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "button.h"
+
 // Kick off the auto-enrollment sequence for a newly-(re-)joined button.
 // Schedules (with delays) on the Zigbee scheduler:
 //   t=0     write our IEEE into the device's IAS_CIE_Address attribute
@@ -25,5 +27,5 @@ void enrollment_handle_enroll_request(uint16_t src_short_addr,
 // cluster (manufacturer / model / firmware version). Responses arrive
 // asynchronously via the action handler's READ_ATTR_RESP / DISC_ATTR_RESP
 // callbacks.
-void discover_button_attrs(void);
-void read_button_basic(void);
+void discover_button_attrs(const button_t *btn);
+void read_button_basic(const button_t *btn);

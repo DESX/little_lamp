@@ -16,6 +16,13 @@
 #include "enrollment.h"
 #include "log.h"
 
+// SDK exception: ESP-Zigbee SDK invokes esp_zb_app_signal_handler and
+// the APS/action callbacks by symbol name; no user-data pointer is
+// threaded through. We stash the application's commissioning_t at
+// zigbee_start time and reach into it from those callbacks. Storage
+// lives in main; this is a cached pointer.
+static commissioning_t *s_commissioning = NULL;
+
 // ── Tuning knobs ────────────────────────────────────────────────────────────
 
 #define COORDINATOR_ENDPOINT    1
@@ -185,7 +192,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                         my_ieee[7], my_ieee[6], my_ieee[5], my_ieee[4],
                         my_ieee[3], my_ieee[2], my_ieee[1], my_ieee[0]);
                 LAMP_LOGI("zb: rebooted into existing network");
-                if (!commissioning_complete()) {
+                if (!commissioning_complete(s_commissioning)) {
                     LAMP_LOGI("zb: opening join window (%ds) + F&B target",
                               JOIN_WINDOW_SECS);
                     esp_zb_bdb_open_network(JOIN_WINDOW_SECS);
@@ -224,7 +231,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             esp_zb_zdo_signal_device_annce_params_t *anc =
                 (esp_zb_zdo_signal_device_annce_params_t *)
                     esp_zb_app_signal_get_params(p_sg_p);
-            commissioning_on_device_announce(anc->device_short_addr, anc->ieee_addr);
+            commissioning_on_device_announce(s_commissioning,
+                                             anc->device_short_addr,
+                                             anc->ieee_addr);
             break;
         }
 
@@ -369,7 +378,8 @@ static void zigbee_task(void *pv) {
     esp_zb_stack_main_loop();
 }
 
-void zigbee_start(void) {
+void zigbee_start(commissioning_t *commissioning) {
+    s_commissioning = commissioning;
     esp_zb_platform_config_t platform = {
         .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
         .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },

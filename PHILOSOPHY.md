@@ -163,59 +163,112 @@ one-off command.
 
 ## The main file is the architecture, in code
 
-The top-level source file (`main.c` here, but the principle generalizes
-to whatever your entry point is) is where a stranger reads the system and
-understands what it does. It must contain the **core logic** of the
-system and almost nothing else. A reader of `main.c` alone should be
-able to:
+The top-level source file (`main.c` here) is where a stranger reads the
+system and understands what it does, **without help from comments,
+diagrams, or external documentation**. The code itself is the
+explanation. If you find yourself needing a comment to say what a
+function or variable is for, the name is wrong or the abstraction is
+wrong — fix that, don't paper over it.
 
-- See every event the system reacts to, with names that describe the
-  event in domain terms ("button pressed," "boundary crossed,"
-  "device paired") — not protocol terms ("APS data indication arrived,"
-  "BDB signal 0x12 fired").
-- Trace what happens after each event through small, named functions
-  whose bodies fit on a screen.
-- Read the state machine as English. If a transition rule needs a
-  paragraph of comment to explain it, the code itself is wrong.
-- See the system's performance structure — interrupt handler →
-  ring buffer → worker task — because that structure is *what makes
-  the system behave the way it does* and it belongs in the architecture
-  diagram, not buried in a peripheral driver.
-- Identify which subsystems exist and where they live: a single line
-  like `zigbee_init()` or `console_init()` is enough; the reader
-  doesn't need to know how they work, only that they exist and what
-  events they emit.
+### Persistent state lives in `main`, allocated by name
 
-What does NOT belong in `main.c`:
+Every long-lived object the system owns — the log, the state machine,
+the device records, the schedule controller, the network connection,
+the queue between an interrupt handler and a worker task — is **declared
+in `main` as a named variable**. The reader of `main.c` sees the full
+list of "things the system has." There are no hidden file-static
+singletons buried in helper modules; every piece of state has a visible
+home with a name a human chose.
 
-- Hex constants for protocols, cluster IDs, attribute IDs, register
-  offsets, command bytes.
-- Bit-level parsing of incoming frames — frame control bytes,
-  manufacturer-specific encoding, TSN extraction, payload layouts.
-- Vendor-specific quirks. If the button has a 1.5-second debounce that
-  needs a particular write to an undocumented attribute, that write
-  lives in `enrollment.c` or `quirks/<vendor>.c`. `main.c` says
-  `kick_off_enrollment(device_short_addr)` and moves on.
+```c
+static log_t          g_log;
+static button_t       g_button;
+static bulb_t         g_bulb;
+static state_machine_t g_state;
+```
+
+A stranger reading those five lines knows exactly what the system
+remembers. To find where any of them is touched, `grep` finds every
+call site.
+
+### Operations on state pass that state explicitly
+
+Functions that mutate or inspect a struct take a pointer to it as their
+first argument. `log_set_verbose(&g_log, true)` not `log_set_verbose(true)`.
+The reader of any call site sees what data is being touched. The reader
+of any function body sees what data it works on.
+
+This is just object-oriented code without inheritance. The struct is
+the object; the functions whose names start with the struct's prefix
+are its methods; the first parameter is `self`. Anyone who's read good
+C can follow it.
+
+### Configuration is visible at the call site
+
+The first thing a function does to an object should not be reaching
+into globals to figure out how to behave. Whatever the caller wants
+configured, the caller passes in.
+
+```c
+log_init(&g_log);
+log_set_verbose(&g_log, persisted_verbose_from_nvs());
+log_drainer_start(&g_log);
+```
+
+A reader of `main.c` learns the system's startup intent from main itself.
+They don't have to open `log.c` and dig through `log_init` to discover
+that verbosity is loaded from NVS — that's main's job to know and main's
+job to show.
+
+### Heavy lifting is in another file, but the call is in main
+
+The body of `log_drainer_start` is in `log.c` — that's appropriate, it's
+mechanical and long. But the **invocation** is in `main.c`. The
+control flow is visible from main; only the implementation lives
+elsewhere.
+
+The exception is interrupt handlers and other low-level mechanisms that
+have to be defined in their module to satisfy the linker or the SDK.
+For those, main still shows the **wiring**: which module's handler
+will fire which application callback, and where in main that callback
+lives.
+
+### Avoid comments by making the code obvious
+
+Comments age out of sync with code. A function named
+`button_register_press_callback` doesn't need a comment to say it
+registers a press callback. A struct field named `last_press_tsn`
+doesn't need a comment to say it stores the last press TSN. If a comment
+seems necessary, the variable or function probably needs renaming.
+
+The legitimate uses of comments are:
+
+- **Why**: external constraints, hardware quirks, the rationale behind a
+  non-obvious design decision. ("The 3RSB22BZ rejects this command in
+  Echo mode; we send it anyway because we don't know the mode at boot.")
+- **Sources**: a citation to a spec section, datasheet page, or
+  upstream issue the reader would otherwise have to hunt for.
+
+If a comment is just rephrasing the code, delete it.
+
+### What does NOT belong in `main.c`
+
+- Hex constants for protocols, cluster IDs, register offsets.
+- Bit-level frame parsing.
+- Vendor-specific quirks. `kick_off_enrollment(&g_button)` is fine;
+  the body of `kick_off_enrollment` belongs in `enrollment.c`.
 - Cluster registration tables, endpoint descriptors, network parameters.
-  These describe *how* we speak Zigbee, not *what* the system does.
-- Anything you'd describe by saying "look, you need to know the spec
-  to read this."
 
-The test isn't lines of code — it's whether someone unfamiliar with the
-codebase can:
+### Acknowledged exception: third-party libraries
 
-1. Read `main.c` end-to-end in ten minutes.
-2. Point at every place the system makes a decision.
-3. Modify any decision (change which event fires which action, add a
-   new event, reorder the state machine) without ever opening another
-   file — unless their change is specifically about *how* a peripheral
-   speaks.
-
-When `main.c` grows beyond the size of "things a human can hold in their
-head at once" (call it ~400 lines), it's a signal to push concrete
-mechanics out into named modules and replace them with named callbacks.
-The job is not to make `main.c` short for its own sake. The job is to
-keep it the place where the system's intent is visible.
+Some libraries — including most SDKs we depend on — use file-static
+singletons internally and don't expose object handles. The ESP-Zigbee
+SDK is one. The ESP-IDF console is another. For these, the helper
+module holds the file-static state as a necessary evil; we still
+**call its init from main** so the wiring is visible, and we still
+**pass our own objects** to the helper so the helper has explicit
+state to act on. Document the deviation in the helper's source — once,
+at the top, plainly.
 
 ## Single-click direct manipulation
 

@@ -150,11 +150,11 @@ void enrollment_handle_enroll_request(uint16_t src, uint8_t ep) {
     esp_zb_scheduler_alarm(deferred_enroll_response, 0, 0);
 }
 
-void discover_button_attrs(void) {
-    uint16_t target = button_short_addr();
-    if (!button_is_known() || target == 0xFFFE) {
+void discover_button_attrs(const button_t *btn) {
+    uint16_t target = button_short_addr(btn);
+    if (!button_is_known(btn) || target == 0xFFFE) {
         LAMP_UI("discover: no button known (button_known=%d short=0x%04x)",
-                (int)button_is_known(), target);
+                (int)button_is_known(btn), target);
         return;
     }
     esp_zb_zcl_disc_attr_cmd_t cmd = {0};
@@ -171,9 +171,9 @@ void discover_button_attrs(void) {
     LAMP_UI("discover: sent (cluster=0xFF01 mfg=0x1233 start=0x0000 max=32)");
 }
 
-void read_button_basic(void) {
-    uint16_t target = button_short_addr();
-    if (!button_is_known() || target == 0xFFFE) {
+void read_button_basic(const button_t *btn) {
+    uint16_t target = button_short_addr(btn);
+    if (!button_is_known(btn) || target == 0xFFFE) {
         LAMP_UI("read-basic: no button known");
         return;
     }

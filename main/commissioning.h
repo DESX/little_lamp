@@ -1,20 +1,38 @@
-// Owns the join window and the persistence of which IEEE addresses play
-// which role (button vs bulb). On boot: opens the join window iff NVS does
-// not have both a button and a bulb bound.
-
 #pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
 
-void commissioning_init(void);
+#include "bulb.h"
+#include "button.h"
 
-// Called by the Zigbee signal handler when a new device announces itself.
-void commissioning_on_device_announce(uint16_t short_addr, const uint8_t ieee[8]);
+typedef struct {
+    bool      known;
+    uint64_t  ieee;
+    uint8_t   endpoint;
+    uint16_t  short_addr;
+} role_binding_t;
 
-// True once we have both a button and a bulb persistently bound.
-bool commissioning_complete(void);
+// Callback fired whenever the paired-device set changes (a new device
+// pairs, or a known one re-announces with a fresh short address).
+// main implements this so it can re-render the status banner without
+// commissioning.c needing to know about the banner.
+typedef void (*commissioning_event_cb_t)(void);
 
-// Force a re-pair: clears NVS bindings. Currently invoked via `make erase-nvs`
-// which wipes the whole flash; provided here for completeness.
-void commissioning_reset(void);
+typedef struct {
+    role_binding_t button_role;
+    role_binding_t bulb_role;
+    button_t      *button;
+    bulb_t        *bulb;
+    commissioning_event_cb_t  on_change;
+} commissioning_t;
+
+void commissioning_init(commissioning_t *c,
+                        button_t *btn,
+                        bulb_t   *blb,
+                        commissioning_event_cb_t on_change);
+void commissioning_on_device_announce(commissioning_t *c,
+                                      uint16_t short_addr,
+                                      const uint8_t ieee[8]);
+bool commissioning_complete(const commissioning_t *c);
+void commissioning_reset(commissioning_t *c);

@@ -1,25 +1,20 @@
-// Zigbee subsystem. Hides every protocol-level detail — cluster IDs,
-// frame parsing, signal-handler dispatch tables, coordinator endpoint
-// descriptors — from main.c.
-//
-// The only thing main.c does with Zigbee is:
-//   1) call zigbee_start() at boot
-//   2) implement the callbacks declared in this header, which the
-//      subsystem fires when something the application cares about
-//      happens.
-
 #pragma once
 
-#include <stdint.h>
+#include "commissioning.h"
 
-// Bring up the Zigbee stack. Forms a fresh network on first boot or
-// rejoins the persisted one on subsequent boots. Opens a 180-second join
-// window if either device is unpaired. Returns once the stack task has
-// been created — events arrive asynchronously after that.
-void zigbee_start(void);
+// zb owns the connection to ZBOSS / ESP-Zigbee SDK. The SDK keeps its
+// own state file-static and registers callbacks by symbol name, so zb
+// stashes the application's commissioning_t pointer at start time and
+// uses it inside the signal handler. That's the documented SDK
+// exception; the storage itself still lives in main.
+//
+// Application contract:
+//   - main calls zigbee_start(&commissioning) once at boot.
+//   - zb fires on_button_press_event() (declared below, defined in
+//     main) whenever a frame classified as a button press arrives.
+//   - everything else (frame parsing, signal dispatch, cluster
+//     registration, vendor quirks) is private to zb.c.
+void zigbee_start(commissioning_t *commissioning);
 
-// Application callback: fires when a button press arrives from any
-// paired button device, regardless of which Zigbee protocol path the
-// button used (OnOff cluster command, Multistate Input report, IAS Zone
-// Status Change Notification — all converge here). main.c implements it.
+// Implemented in main.
 void on_button_press_event(void);
