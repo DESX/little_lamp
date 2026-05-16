@@ -9,10 +9,12 @@ device's behavior** — see "Firmware modes" below.
 | Field | Value |
 |---|---|
 | Model identifier (ZCL Basic 0x0005) | `"3RSB22BZ"` (exact, no padding) |
+| Marking on back plate | `3RSB22BZ` |
 | Manufacturer string (ZCL Basic 0x0004) | `"Third Reality, Inc"` — **comma, period after Reality, no period after Inc** |
 | Manufacturer code (node descriptor) | `0x1233` (4659 decimal) — Telink Semi |
 | Logical type | End Device, sleepy (RxOffWhenIdle) |
-| Power source | Battery (CR2032 coin cell) |
+| Power source | **2× AAA batteries** (not a coin cell — earlier 3RSB015BZ revisions used CR2032 but this revision is AAA) |
+| Physical form | White plastic puck, single round front button. Battery cover slides off the back; inside is the PCB. |
 | OUI (IEEE first 3 bytes, MSB first) | varies; the lower 8-byte IEEE for our unit is `b4:0e:06:06:56:46:ff:ff` reverse-encoded as `ffffb40e06065646` on the wire (little-endian) |
 
 ## Firmware modes — THIS IS THE BIG ONE
@@ -55,10 +57,15 @@ button is identical. Behavior is completely different:
 
 This is a **physical gesture on the button**, not a software command. Required exactly once per unit.
 
+**Where the "reset button" is**: slide off the back battery cover. The PCB
+inside has a small tactile button next to the AAA holders — that's the
+reset button. The front face of the device only has the one big primary
+button; the reset is hidden inside.
+
 | Button firmware (Basic attr 0x4000) | Gesture |
 |---|---|
-| ≥ 1.00.22 | Press the **rear reset button 5 times within 5 seconds** |
-| < 1.00.22 | Hold the **front button + rear reset button simultaneously for 5 seconds** |
+| ≥ 1.00.22 | Press the **PCB reset button 5 times within 5 seconds** |
+| < 1.00.22 | Hold the **front button + PCB reset button simultaneously for 5 seconds** |
 
 You'll see the pairing-mode LED change from blue+red to blue-only. Then re-pair the button — it'll come up as device_type 0x0006 with Multistate Input.
 
@@ -75,9 +82,10 @@ of the front button.
 
 ## Battery
 
-CR2032. Lasts months to a year depending on press frequency. The Power
-Configuration cluster (0x0001) reports `batteryPercentageRemaining` (attr
-0x0021) periodically.
+2× AAA. Slide off the back cover to access. The Power Configuration
+cluster (0x0001) reports `batteryPercentageRemaining` (attr 0x0021)
+periodically; we get those reports in the verbose log as
+`rx frame: cluster=0x0001 cmd=0x0a`.
 
 ## Programming quirks specific to this button
 

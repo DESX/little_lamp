@@ -31,6 +31,14 @@ bool button_is_known(void) {
     return s_known;
 }
 
+uint16_t button_short_addr(void) {
+    return s_short_addr;
+}
+
+uint8_t button_endpoint(void) {
+    return s_endpoint;
+}
+
 bool button_dispatch_on_off(uint16_t src_addr, uint8_t src_endpoint, uint8_t cmd_id) {
     if (!s_known) {
         LAMP_LOGW("button: on/off from 0x%04x ep=%u cmd=0x%02x (no button paired yet)",

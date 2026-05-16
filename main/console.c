@@ -70,6 +70,23 @@ static int cmd_pair(int argc, char **argv) {
     return 0;
 }
 
+extern void discover_button_attrs(void);
+extern void read_button_basic(void);
+
+static int cmd_discover(int argc, char **argv) {
+    (void)argc; (void)argv;
+    LAMP_UI("Discovering attributes on button's cluster 0xFF01...");
+    discover_button_attrs();
+    return 0;
+}
+
+static int cmd_button_info(int argc, char **argv) {
+    (void)argc; (void)argv;
+    LAMP_UI("Reading button's Basic-cluster attributes...");
+    read_button_basic();
+    return 0;
+}
+
 void console_init(void) {
     // Use USB Serial-JTAG for both the log and the console. Keep things simple
     // — line-buffered, no fancy editing.
@@ -123,6 +140,20 @@ void console_init(void) {
         .func    = &cmd_pair,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&pair_cmd));
+
+    const esp_console_cmd_t discover_cmd = {
+        .command = "discover",
+        .help    = "Send Discover Attributes for cluster 0xFF01 to the button",
+        .func    = &cmd_discover,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&discover_cmd));
+
+    const esp_console_cmd_t button_info_cmd = {
+        .command = "button-info",
+        .help    = "Read the button's Basic-cluster identity (manuf, model, fw version)",
+        .func    = &cmd_button_info,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&button_info_cmd));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     LAMP_LOGI("console: ready (try `set-time <epoch>`)");

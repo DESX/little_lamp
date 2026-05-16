@@ -262,6 +262,57 @@ static void do_verify_double_click(uint8_t arg) {
     LAMP_LOGI("3R: reading cancelDoubleClick back from 0x%04x", s_enroll_target_short);
 }
 
+// Manually triggered (`discover` console command) attribute scan of the
+// button's cluster 0xFF01. Used to find what timing-related attributes the
+// firmware actually supports, when our blind cancelDoubleClick write returns
+// UNSUPPORTED_ATTRIBUTE.
+extern void discover_button_attrs(void);
+
+void discover_button_attrs(void) {
+    uint16_t target = button_short_addr();
+    if (!button_is_known() || target == 0xFFFE) {
+        LAMP_UI("discover: no button known (button_known=%d short=0x%04x)",
+                (int)button_is_known(), target);
+        return;
+    }
+    esp_zb_zcl_disc_attr_cmd_t cmd = {0};
+    cmd.zcl_basic_cmd.dst_addr_u.addr_short = target;
+    cmd.zcl_basic_cmd.dst_endpoint = 1;
+    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
+    cmd.address_mode      = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    cmd.cluster_id        = TR_PRIVATE_CLUSTER;
+    cmd.manuf_specific    = 1;
+    cmd.manuf_code        = TR_PRIVATE_MFG_CODE;
+    cmd.start_attr_id     = 0x0000;
+    cmd.max_attr_number   = 32;
+    esp_zb_zcl_disc_attr_cmd_req(&cmd);
+    LAMP_UI("discover: sent (cluster=0xFF01 mfg=0x1233 start=0x0000 max=32)");
+}
+
+// Read the button's Basic cluster (0x0000) for ZCL version (0x0000),
+// applicationVersion (0x0001), softwareBuildID (0x4000), manuf (0x0004),
+// model (0x0005). The softwareBuildID is what tells us whether an OTA
+// upgrade is even possible (compare to latest known image).
+extern void read_button_basic(void);
+void read_button_basic(void) {
+    uint16_t target = button_short_addr();
+    if (!button_is_known() || target == 0xFFFE) {
+        LAMP_UI("read-basic: no button known");
+        return;
+    }
+    static uint16_t attrs[] = {0x0000, 0x0001, 0x0004, 0x0005, 0x4000};
+    esp_zb_zcl_read_attr_cmd_t cmd = {0};
+    cmd.zcl_basic_cmd.dst_addr_u.addr_short = target;
+    cmd.zcl_basic_cmd.dst_endpoint = 1;
+    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
+    cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    cmd.clusterID    = 0x0000;  // Basic
+    cmd.attr_number  = sizeof(attrs) / sizeof(attrs[0]);
+    cmd.attr_field   = attrs;
+    esp_zb_zcl_read_attr_cmd_req(&cmd);
+    LAMP_UI("read-basic: sent (ZCL ver, app ver, manuf, model, swBuildID)");
+}
+
 // Public entry. Call once on each device-announce from the button.
 void start_ias_enrollment(uint16_t short_addr) {
     s_enroll_target_short = short_addr;
@@ -288,16 +339,29 @@ void start_ias_enrollment(uint16_t short_addr) {
 //      tsn) ring in zb_aps_indication — that's the correct fix for APS
 //      retransmissions, which re-use the original TSN.
 static uint32_t s_press_count = 0;
+static TaskHandle_t s_press_task = NULL;
 
-static void deferred_state_press(uint8_t arg) {
-    (void)arg;
-    state_handle_button_press();
+// Press dispatch task. Runs at high priority (above the Zigbee task) so it
+// processes a notification as soon as the Zigbee task drops its lock. Uses
+// xTaskNotify with pdFALSE so back-to-back gives accumulate — every press
+// is processed in order even if they arrive faster than the task drains.
+static void press_dispatch_task(void *pv) {
+    (void)pv;
+    for (;;) {
+        ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+        state_handle_button_press();
+    }
 }
 
+// Called from the APS callback. Must never block: anything that could stall
+// (state machine, bulb commands, printf) is moved off-thread via the press
+// task and the LAMP_UI drainer queue.
 static void on_button_press(void) {
     s_press_count++;
-    LAMP_UI("button press %lu", (unsigned long)s_press_count);
-    esp_zb_scheduler_alarm(deferred_state_press, 0, 0);
+    LAMP_UI("button press %lu", (unsigned long)s_press_count);  // non-blocking
+    if (s_press_task != NULL) {
+        xTaskNotifyGive(s_press_task);
+    }
 }
 
 // Runtime reply to incoming Zone Enroll Request frames (Trip-to-Pair flow).
@@ -404,27 +468,31 @@ static bool zb_aps_indication(esp_zb_apsde_data_ind_t ind) {
         //   - frames where only non-alarm bits flipped (supervision pings etc.)
         is_press = alarm && !s_prev_alarm;
         s_prev_alarm = alarm;
-    } else if (!cluster_specific &&
-               ind.cluster_id == MULTISTATE_CLUSTER &&
-               cmd_id == 0x0a &&    // ZCL global "Report Attributes"
+    } else if (cluster_specific &&
+               ind.cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
                ind.profile_id == 0x0104 &&
-               ind.asdu_length >= hdr_len + 5) {
-        // Multistate Input cluster Report Attributes: payload is one or more
-        // reports, each {attr_id (2 LE), type (1), value (variable)}. For
-        // presentValue (0x0055), type is 0x21 (uint16) and value is the
-        // click code. We treat value==1 (single click) as a press.
-        uint16_t attr_id = (uint16_t)ind.asdu[hdr_len] |
-                           ((uint16_t)ind.asdu[hdr_len + 1] << 8);
-        uint8_t  type    = ind.asdu[hdr_len + 2];
-        uint16_t value   = (uint16_t)ind.asdu[hdr_len + 3] |
-                           ((uint16_t)ind.asdu[hdr_len + 4] << 8);
-        LAMP_LOGI("multistate report attr=0x%04x type=0x%02x val=%u",
-                  attr_id, type, value);
-        if (attr_id == MULTISTATE_ATTR_PRESENT_VAL &&
-            value == MULTISTATE_VALUE_SINGLE) {
-            is_press = true;
-        }
+               (cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID ||
+                cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID ||
+                cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE_ID)) {
+        // Standard-mode button: the 3RSB22BZ sends a cluster-specific OnOff
+        // command (On / Off / Toggle) IMMEDIATELY on each press — before
+        // it does the ~300 ms single/double-click discrimination wait that
+        // it does on the Multistate Input report path. We listen here for
+        // absolute minimum latency. Cluster-specific + profile guards keep
+        // us safe from:
+        //   - global Default Responses (cmd 0x0b) from the bulb (cluster
+        //     specific=false → filtered)
+        //   - ZDP Match Descriptor Request (profile=0x0000 → filtered)
+        // Tradeoff: we cannot distinguish single from double press. Single
+        // press = toggle. Double press = toggle twice (no net change). For
+        // our user story (single press toggles light) this is exactly what
+        // we want.
+        is_press = true;
     }
+    // The Multistate Input report path (cluster 0x0012) is intentionally
+    // not handled — it carries the same logical event ~300 ms later. If
+    // future use cases need to distinguish double-press / hold, re-enable
+    // the Multistate path and pick which channel wins.
 
     if (is_press) {
         on_button_press();
@@ -563,6 +631,17 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t cb_id,
                       msg->info.cluster, msg->info.dst_endpoint, msg->attribute.id);
             break;
         }
+        case ESP_ZB_CORE_CMD_DISC_ATTR_RESP_CB_ID: {
+            const esp_zb_zcl_cmd_discover_attributes_resp_message_t *m =
+                (const esp_zb_zcl_cmd_discover_attributes_resp_message_t *)message;
+            LAMP_UI("disc-resp cluster=0x%04x complete=%d:",
+                    m->info.cluster, m->is_completed);
+            for (const esp_zb_zcl_disc_attr_variable_t *v = m->variables;
+                 v != NULL; v = v->next) {
+                LAMP_UI("  attr=0x%04x type=0x%02x", v->attr_id, v->data_type);
+            }
+            break;
+        }
         case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID: {
             const esp_zb_zcl_cmd_read_attr_resp_message_t *m =
                 (const esp_zb_zcl_cmd_read_attr_resp_message_t *)message;
@@ -686,6 +765,7 @@ static void zigbee_task(void *pv) {
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     log_init();
+    log_drainer_start();   // LAMP_UI now flows through a queue, not direct printf
 
     LAMP_LOGI("─── lamp boot ───");
 
@@ -707,8 +787,12 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&platform));
 
-    xTaskCreate(zigbee_task,  "zb",       4096, NULL, 5, NULL);
-    xTaskCreate(boundary_task, "boundary", 2048, NULL, 4, NULL);
+    xTaskCreate(zigbee_task,        "zb",       4096, NULL, 5, NULL);
+    xTaskCreate(boundary_task,      "boundary", 2048, NULL, 4, NULL);
+    // Press dispatch task at priority 6 (above the Zigbee task) so a press
+    // pulls the Zigbee lock as soon as ZBOSS releases it. State machine and
+    // bulb commands run here, off the APS callback's critical path.
+    xTaskCreate(press_dispatch_task, "press",   4096, NULL, 6, &s_press_task);
 
     LAMP_LOGI("─── boot complete ───");
 }

@@ -1,7 +1,12 @@
 #include "log.h"
 
+#include <stdarg.h>
 #include <stdbool.h>
+#include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "nvs.h"
 
 #include "bulb.h"
@@ -13,6 +18,50 @@
 
 #define NVS_NAMESPACE  "lamp"
 #define NVS_KEY_VERBOSE "verbose"
+
+// LAMP_UI ring: producers (any task) format a line and enqueue. The drainer
+// task pulls from the queue and writes to stdout. If the queue is full, the
+// line is dropped — the Zigbee task must never block on USB-Serial-JTAG
+// back-pressure.
+#define UI_LINE_MAX     128
+#define UI_QUEUE_DEPTH  32
+static QueueHandle_t s_ui_queue = NULL;
+
+void lamp_ui_print(const char *fmt, ...) {
+    char buf[UI_LINE_MAX];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (n < 0) return;
+    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+    if (s_ui_queue == NULL) {
+        // Drainer task not running yet (early boot). Fall back to direct
+        // blocking write so early-boot banners still appear.
+        fputs(buf, stdout);
+        fflush(stdout);
+        return;
+    }
+    // 0 timeout = non-blocking. Drops line if queue is full.
+    xQueueSend(s_ui_queue, buf, 0);
+}
+
+static void log_drainer_task(void *pv) {
+    (void)pv;
+    char buf[UI_LINE_MAX];
+    for (;;) {
+        if (xQueueReceive(s_ui_queue, buf, portMAX_DELAY) == pdTRUE) {
+            fputs(buf, stdout);
+            fflush(stdout);
+        }
+    }
+}
+
+void log_drainer_start(void) {
+    if (s_ui_queue != NULL) return;  // already started
+    s_ui_queue = xQueueCreate(UI_QUEUE_DEPTH, UI_LINE_MAX);
+    xTaskCreate(log_drainer_task, "lamp_ui", 2560, NULL, 1, NULL);
+}
 
 static bool s_verbose = false;
 

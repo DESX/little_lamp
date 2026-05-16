@@ -10,6 +10,8 @@ void button_init(void);
 
 void button_set_address(uint16_t short_addr, uint8_t endpoint);
 bool button_is_known(void);
+uint16_t button_short_addr(void);
+uint8_t button_endpoint(void);
 
 // Returns true if the given source matched our paired button. Called by
 // the global Zigbee action handler when an OnOff cluster command arrives.
