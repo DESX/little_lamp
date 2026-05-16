@@ -161,6 +161,62 @@ environment variables, and dependency relationships. If there isn't a
 target for something, that's a gap to fix — not a reason to run a
 one-off command.
 
+## The main file is the architecture, in code
+
+The top-level source file (`main.c` here, but the principle generalizes
+to whatever your entry point is) is where a stranger reads the system and
+understands what it does. It must contain the **core logic** of the
+system and almost nothing else. A reader of `main.c` alone should be
+able to:
+
+- See every event the system reacts to, with names that describe the
+  event in domain terms ("button pressed," "boundary crossed,"
+  "device paired") — not protocol terms ("APS data indication arrived,"
+  "BDB signal 0x12 fired").
+- Trace what happens after each event through small, named functions
+  whose bodies fit on a screen.
+- Read the state machine as English. If a transition rule needs a
+  paragraph of comment to explain it, the code itself is wrong.
+- See the system's performance structure — interrupt handler →
+  ring buffer → worker task — because that structure is *what makes
+  the system behave the way it does* and it belongs in the architecture
+  diagram, not buried in a peripheral driver.
+- Identify which subsystems exist and where they live: a single line
+  like `zigbee_init()` or `console_init()` is enough; the reader
+  doesn't need to know how they work, only that they exist and what
+  events they emit.
+
+What does NOT belong in `main.c`:
+
+- Hex constants for protocols, cluster IDs, attribute IDs, register
+  offsets, command bytes.
+- Bit-level parsing of incoming frames — frame control bytes,
+  manufacturer-specific encoding, TSN extraction, payload layouts.
+- Vendor-specific quirks. If the button has a 1.5-second debounce that
+  needs a particular write to an undocumented attribute, that write
+  lives in `enrollment.c` or `quirks/<vendor>.c`. `main.c` says
+  `kick_off_enrollment(device_short_addr)` and moves on.
+- Cluster registration tables, endpoint descriptors, network parameters.
+  These describe *how* we speak Zigbee, not *what* the system does.
+- Anything you'd describe by saying "look, you need to know the spec
+  to read this."
+
+The test isn't lines of code — it's whether someone unfamiliar with the
+codebase can:
+
+1. Read `main.c` end-to-end in ten minutes.
+2. Point at every place the system makes a decision.
+3. Modify any decision (change which event fires which action, add a
+   new event, reorder the state machine) without ever opening another
+   file — unless their change is specifically about *how* a peripheral
+   speaks.
+
+When `main.c` grows beyond the size of "things a human can hold in their
+head at once" (call it ~400 lines), it's a signal to push concrete
+mechanics out into named modules and replace them with named callbacks.
+The job is not to make `main.c` short for its own sake. The job is to
+keep it the place where the system's intent is visible.
+
 ## Single-click direct manipulation
 
 In the CMS UI, every action is a single click on a visible target. No

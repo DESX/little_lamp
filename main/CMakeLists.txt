@@ -10,6 +10,7 @@ idf_component_register(
         "rtc.c"
         "console.c"
         "log.c"
+        "zb.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         nvs_flash

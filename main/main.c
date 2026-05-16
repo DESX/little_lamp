@@ -1,15 +1,48 @@
-// Firmware entry point: brings up Zigbee, wires the modules together, and
-// owns the long-lived background tasks.
-
-#include <inttypes.h>
-#include <string.h>
+// main.c — the architectural overview of the lamp.
+//
+// What this system does, in one diagram:
+//
+//     ┌──────────┐  press   ┌──────────────┐  notify  ┌──────────────────┐
+//     │  Button  ├─────────▶│ Zigbee stack │─────────▶│ press_dispatch   │
+//     └──────────┘   RF     │   (zb.c)     │  queue   │     _task        │
+//                           └──────────────┘          └────────┬─────────┘
+//                                                              │
+//                                                  state_handle_button_press()
+//                                                              │
+//                                                              ▼
+//                                                   ┌────────────────────┐
+//     ┌──────────┐  ZCL cmd  ┌────────────┐ render() │  state machine    │
+//     │   Bulb   │◀──────────│   bulb.c   │◀─────────│  (state.c)        │
+//     └──────────┘     RF    └────────────┘          └────────────────────┘
+//
+// Three long-lived tasks make up the system:
+//
+//   zigbee_task            (priority 5)  — ZBOSS event loop. Receives radio
+//                                          frames; invokes the APS handler
+//                                          in zb.c, which fires
+//                                          on_button_press_event() for any
+//                                          frame we classify as a press.
+//   press_dispatch_task    (priority 6)  — woken by a FreeRTOS task notify
+//                                          from on_button_press_event().
+//                                          Runs the state machine and sends
+//                                          bulb commands. Above the Zigbee
+//                                          task in priority so it grabs the
+//                                          stack lock the moment ZBOSS
+//                                          releases it.
+//   boundary_task          (priority 4)  — sleeps until the next schedule
+//                                          boundary (06:40 / 19:30) and
+//                                          re-renders the bulb if the lamp
+//                                          is currently OFF.
+//
+// LAMP_UI(...) prints curated user-facing lines through a ring buffer drained
+// by yet another low-priority task (log.c). No producer ever blocks on the
+// USB serial port.
+//
+// To change WHAT the system does, edit this file. To change HOW it speaks
+// Zigbee, edit zb.c. To change device-specific behaviors, edit the
+// appropriate file in devices/ + the matching module.
 
 #include "esp_check.h"
-#include "esp_zigbee_core.h"
-#include "ha/esp_zigbee_ha_standard.h"
-#include "aps/esp_zigbee_aps.h"
-#include "test/esp_zigbee_test_utils.h"  // esp_zb_nwk_set_ed_timeout
-#include "esp_zigbee_secur.h"
 #include "nvs_flash.h"
 
 #include "freertos/FreeRTOS.h"
@@ -19,109 +52,21 @@
 #include "button.h"
 #include "commissioning.h"
 #include "console.h"
-#include "enrollment.h"
 #include "log.h"
 #include "rtc.h"
 #include "schedule.h"
 #include "state.h"
+#include "zb.h"
 
-// Note: button.h still owns the press-event channel for completeness; we now
-// call state_handle_button_press() directly from the OnOff attr callback.
+// ── Press dispatch ──────────────────────────────────────────────────────────
+// on_button_press_event is the only callback zb.c needs from us. It runs
+// inside the Zigbee task's APS context, so it must do almost nothing.
+// We count the press, print a non-blocking UI line, and wake the dispatch
+// task — which is what actually drives the state machine.
 
-#define COORDINATOR_ENDPOINT 1
-#define JOIN_WINDOW_SECS     180
+static uint32_t      s_press_count = 0;
+static TaskHandle_t  s_press_task  = NULL;
 
-// Pin to Zigbee channel 25 (2475 MHz). Sits above Wi-Fi 2.4 GHz channels
-// 1/6/11, so it avoids the worst of Wi-Fi interference. To scan all
-// channels instead, use 0x07FFF800.
-#define ESP_ZB_PRIMARY_CHANNEL_MASK (1u << 25)
-
-
-// Wrapper to match esp_zb_callback_t (void return) when scheduling.
-static void retry_form_network(uint8_t mode) {
-    esp_zb_bdb_start_top_level_commissioning(mode);
-}
-
-// ── APS-level frame catcher ─────────────────────────────────────────────────
-// Fires for every incoming Zigbee frame, regardless of whether higher-level
-// SDK callbacks match. Used to (a) prove the button is reaching us, and (b)
-// route OnOff cluster commands to the state machine even when they arrive
-// in a form ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID doesn't catch (e.g. group-
-// addressed Toggle commands).
-// IAS Zone cluster (0x0500): the 3RSB022Z sends Zone Status Change
-// Notifications (server-to-client cmd 0x00) on press. Used only in the
-// button's "Echo mode" firmware path, which has a baked-in 1.5–2 s
-// motion-sensor-style dwell. After the mode-switch gesture (5 quick
-// taps on the reset button) the button uses Multistate Input instead.
-#define IAS_ZONE_CLUSTER             0x0500
-#define IAS_ZONE_CMD_STATUS_CHANGE   0x00
-#define IAS_ZONE_CMD_ENROLL_REQUEST  0x01
-
-// Multistate Input cluster (0x0012): the 3RSB022Z's standard (snappy) firmware
-// mode reports button events as Report Attributes on this cluster's
-// presentValue (attr 0x0055). Values per zigbee-herdsman-converters
-// itcmdr_clicks: 1=single, 2=double, 0=hold, 255=release. We treat 1 as a
-// press; 2/0 are ignored (we don't expose double/hold).
-#define MULTISTATE_CLUSTER           0x0012
-#define MULTISTATE_ATTR_PRESENT_VAL  0x0055
-#define MULTISTATE_VALUE_SINGLE      0x0001
-
-// OTA Upgrade cluster (0x0019). The 3RSB22BZ periodically asks "do you
-// have an image for me?" — Query Next Image Request. We intentionally
-// suppress these by returning true from the APS callback, so ZBOSS doesn't
-// auto-reply with UNSUP_CLUSTER_COMMAND. The button does not require a
-// response to remain stable (verified once the aging-timeout fix landed).
-#define OTA_CLUSTER                  0x0019
-#define OTA_CMD_QUERY_NEXT_IMAGE_REQ 0x01
-
-// Frame dedup ring. APS retries re-use the original ZCL TSN, so a tuple of
-// (src_short, cluster, cmd, tsn) uniquely identifies a logical frame
-// regardless of how many physical-layer copies arrive.
-#define DEDUP_RING_SIZE 8
-typedef struct {
-    bool     used;
-    uint16_t src;
-    uint16_t cluster;
-    uint8_t  cmd;
-    uint8_t  tsn;
-} frame_id_t;
-static frame_id_t s_dedup_ring[DEDUP_RING_SIZE];
-static uint8_t    s_dedup_head = 0;
-
-static bool frame_is_duplicate(uint16_t src, uint16_t cluster, uint8_t cmd, uint8_t tsn) {
-    for (int i = 0; i < DEDUP_RING_SIZE; i++) {
-        const frame_id_t *r = &s_dedup_ring[i];
-        if (r->used && r->src == src && r->cluster == cluster &&
-            r->cmd == cmd && r->tsn == tsn) {
-            return true;
-        }
-    }
-    s_dedup_ring[s_dedup_head] = (frame_id_t){
-        .used = true, .src = src, .cluster = cluster, .cmd = cmd, .tsn = tsn,
-    };
-    s_dedup_head = (s_dedup_head + 1) % DEDUP_RING_SIZE;
-    return false;
-}
-
-// IAS Zone enrollment, cancelDoubleClick, and diagnostic readers live in
-// enrollment.c. The APS handler below dispatches to it.
-
-// Press dispatch:
-//   1) UI print and counter happen synchronously from the APS callback so the
-//      user-perceived latency is just RF + USB-serial — no scheduler hop.
-//   2) The state transition (and any bulb commands it triggers) is deferred
-//      onto the Zigbee scheduler so the APS callback returns immediately and
-//      we don't risk a lock against the Zigbee stack.
-//   3) Dedup happens upstream of this function via the (src, cluster, cmd,
-//      tsn) ring in zb_aps_indication — that's the correct fix for APS
-//      retransmissions, which re-use the original TSN.
-static uint32_t s_press_count = 0;
-static TaskHandle_t s_press_task = NULL;
-
-// Press dispatch task. Runs at high priority (above the Zigbee task) so it
-// processes a notification as soon as the Zigbee task drops its lock. Uses
-// xTaskNotify with pdFALSE so back-to-back gives accumulate — every press
-// is processed in order even if they arrive faster than the task drains.
 static void press_dispatch_task(void *pv) {
     (void)pv;
     for (;;) {
@@ -130,127 +75,18 @@ static void press_dispatch_task(void *pv) {
     }
 }
 
-// Called from the APS callback. Must never block: anything that could stall
-// (state machine, bulb commands, printf) is moved off-thread via the press
-// task and the LAMP_UI drainer queue.
-static void on_button_press(void) {
+void on_button_press_event(void) {
     s_press_count++;
-    LAMP_UI("button press %lu", (unsigned long)s_press_count);  // non-blocking
+    LAMP_UI("button press %lu", (unsigned long)s_press_count);
     if (s_press_task != NULL) {
         xTaskNotifyGive(s_press_task);
     }
 }
 
-static bool zb_aps_indication(esp_zb_apsde_data_ind_t ind) {
-    // ZCL frame layout: byte 0 = frame control; if bit 2 (manuf_spec) is set,
-    // bytes 1-2 are the manufacturer code and the TSN/cmd_id are pushed by 2.
-    //
-    // Frame control bits 0-1 are the frame type:
-    //   00 = global ZCL command (Read Attr Resp, etc.) — applies to ALL clusters
-    //   01 = cluster-specific command — only valid for that cluster
-    // A cluster-specific cmd_id 0x01 (e.g. IAS Zone Enroll Request) and a
-    // global cmd_id 0x01 (Read Attributes Response) are different things;
-    // we must not conflate them.
-    uint8_t cmd_id = 0xff;
-    uint8_t tsn    = 0;
-    uint8_t hdr_len = 3;
-    bool cluster_specific = false;
-    if (ind.asdu_length >= 3 && ind.asdu) {
-        uint8_t fc = ind.asdu[0];
-        cluster_specific = ((fc & 0x03) == 0x01);
-        bool manuf = (fc & 0x04) != 0;
-        hdr_len = manuf ? 5 : 3;
-        tsn    = ind.asdu[manuf ? 3 : 1];
-        cmd_id = ind.asdu[manuf ? 4 : 2];
-    }
-    LAMP_LOGI("rx frame: src=0x%04x ep=%u cluster=0x%04x prof=0x%04x cmd=0x%02x%s tsn=%u len=%lu",
-              ind.src_short_addr, ind.src_endpoint, ind.cluster_id,
-              ind.profile_id, cmd_id, cluster_specific ? "(cs)" : "(g)",
-              tsn, (unsigned long)ind.asdu_length);
-
-    // APS retries re-use the original TSN. Dedup on (src, cluster, cmd, tsn)
-    // so we don't double-count retransmissions, while still allowing distinct
-    // logical events through.
-    if (frame_is_duplicate(ind.src_short_addr, ind.cluster_id, cmd_id, tsn)) {
-        LAMP_LOGI("rx frame: dropped duplicate (tsn=%u)", tsn);
-        return false;
-    }
-
-    // IAS Zone status-change. The zone_status word has up to 10 distinct
-    // bits; we treat only the rising edge of bit 0 (alarm1) as "press." A
-    // status with only the higher bits set (supervision, battery, test) is
-    // explicitly not a press, even though the upper bits make the word
-    // non-zero.
-    static bool s_prev_alarm = false;
-    bool is_press = false;
-    if (cluster_specific &&
-        ind.cluster_id == IAS_ZONE_CLUSTER &&
-        cmd_id == IAS_ZONE_CMD_STATUS_CHANGE &&
-        ind.asdu_length >= hdr_len + 2) {
-        uint16_t zone_status =
-            (uint16_t)ind.asdu[hdr_len] |
-            ((uint16_t)ind.asdu[hdr_len + 1] << 8);
-        bool alarm = (zone_status & 0x0001) != 0;
-        bool tamper = (zone_status & 0x0004) != 0;
-        bool battery = (zone_status & 0x0008) != 0;
-        bool supervision = (zone_status & 0x0010) != 0;
-        bool restore = (zone_status & 0x0020) != 0;
-        LAMP_LOGI("ias zone status=0x%04x alarm=%d tamper=%d batt=%d sup=%d rst=%d",
-                  zone_status, alarm, tamper, battery, supervision, restore);
-        // Press = transition 0→1 on alarm1. Filters out:
-        //   - the release frame (alarm 1→0)
-        //   - repeated alarm=1 retransmissions
-        //   - frames where only non-alarm bits flipped (supervision pings etc.)
-        is_press = alarm && !s_prev_alarm;
-        s_prev_alarm = alarm;
-    } else if (cluster_specific &&
-               ind.cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
-               ind.profile_id == 0x0104 &&
-               (cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID ||
-                cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID ||
-                cmd_id == ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE_ID)) {
-        // Standard-mode button: the 3RSB22BZ sends a cluster-specific OnOff
-        // command (On / Off / Toggle) IMMEDIATELY on each press — before
-        // it does the ~300 ms single/double-click discrimination wait that
-        // it does on the Multistate Input report path. We listen here for
-        // absolute minimum latency. Cluster-specific + profile guards keep
-        // us safe from:
-        //   - global Default Responses (cmd 0x0b) from the bulb (cluster
-        //     specific=false → filtered)
-        //   - ZDP Match Descriptor Request (profile=0x0000 → filtered)
-        // Tradeoff: we cannot distinguish single from double press. Single
-        // press = toggle. Double press = toggle twice (no net change). For
-        // our user story (single press toggles light) this is exactly what
-        // we want.
-        is_press = true;
-    }
-    // The Multistate Input report path (cluster 0x0012) is intentionally
-    // not handled — it carries the same logical event ~300 ms later. If
-    // future use cases need to distinguish double-press / hold, re-enable
-    // the Multistate path and pick which channel wins.
-
-    if (is_press) {
-        on_button_press();
-    }
-    if (cluster_specific &&
-        ind.cluster_id == IAS_ZONE_CLUSTER &&
-        cmd_id == IAS_ZONE_CMD_ENROLL_REQUEST) {
-        enrollment_handle_enroll_request(ind.src_short_addr, ind.src_endpoint);
-    }
-    if (cluster_specific &&
-        ind.cluster_id == OTA_CLUSTER &&
-        cmd_id == OTA_CMD_QUERY_NEXT_IMAGE_REQ) {
-        // Suppress ZBOSS's default UNSUP_CLUSTER_COMMAND reply. We don't
-        // run an OTA server, and the button is happy to keep getting no
-        // reply (verified — the leave loop was the aging-timeout default,
-        // not unanswered OTA queries).
-        LAMP_LOGI("ota: query suppressed");
-        return true;
-    }
-    return false;  // let the stack process normally otherwise
-}
-
-// ── Background tasks ────────────────────────────────────────────────────────
+// ── Schedule boundary task ──────────────────────────────────────────────────
+// Sleeps until the next 06:40 or 19:30 boundary, then nudges the state
+// machine. The state machine itself decides whether to re-render the bulb
+// (only when the lamp is OFF — ON is never disturbed by the clock).
 
 static void boundary_task(void *pv) {
     (void)pv;
@@ -266,242 +102,13 @@ static void boundary_task(void *pv) {
     }
 }
 
-// ── Zigbee signal handler ───────────────────────────────────────────────────
-
-void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
-    uint32_t *p_sg_p = signal_struct->p_app_signal;
-    esp_err_t err_status = signal_struct->esp_err_status;
-    esp_zb_app_signal_type_t sig_type = *p_sg_p;
-
-    switch (sig_type) {
-        case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
-            LAMP_LOGI("zb: stack initialized");
-            esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
-            break;
-
-        case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
-            LAMP_LOGI("zb: first-start, forming network");
-            esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
-            break;
-
-        case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
-            if (err_status == ESP_OK) {
-                esp_zb_ieee_addr_t my_ieee;
-                esp_zb_get_long_address(my_ieee);
-                LAMP_UI("coordinator IEEE: %02x%02x%02x%02x%02x%02x%02x%02x",
-                        my_ieee[7], my_ieee[6], my_ieee[5], my_ieee[4],
-                        my_ieee[3], my_ieee[2], my_ieee[1], my_ieee[0]);
-                LAMP_LOGI("zb: rebooted into existing network");
-                if (!commissioning_complete()) {
-                    LAMP_LOGI("zb: opening join window (%ds) + F&B target — bindings incomplete",
-                              JOIN_WINDOW_SECS);
-                    esp_zb_bdb_open_network(JOIN_WINDOW_SECS);
-                    esp_zb_bdb_finding_binding_start_target(COORDINATOR_ENDPOINT,
-                                                            JOIN_WINDOW_SECS);
-                }
-            } else {
-                LAMP_LOGE("zb: reboot failed (0x%x), restarting commissioning", err_status);
-                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
-            }
-            break;
-
-        case ESP_ZB_BDB_SIGNAL_FORMATION:
-            if (err_status == ESP_OK) {
-                esp_zb_ieee_addr_t extended_pan_id;
-                esp_zb_get_extended_pan_id(extended_pan_id);
-                LAMP_LOGI("zb: formed network ch=%d short=0x%04x pan=0x%04x",
-                          esp_zb_get_current_channel(),
-                          esp_zb_get_short_address(),
-                          esp_zb_get_pan_id());
-                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-            } else {
-                LAMP_LOGE("zb: formation failed (0x%x), retrying", err_status);
-                esp_zb_scheduler_alarm(retry_form_network,
-                                       ESP_ZB_BDB_MODE_NETWORK_FORMATION, 1000);
-            }
-            break;
-
-        case ESP_ZB_BDB_SIGNAL_STEERING:
-            LAMP_LOGI("zb: steering done, opening join window (%ds) + F&B target mode",
-                      JOIN_WINDOW_SECS);
-            esp_zb_bdb_open_network(JOIN_WINDOW_SECS);
-            // Advertise ourselves as a Finding & Binding target so a smart
-            // button can bind its OnOff client cluster to our OnOff server.
-            esp_zb_bdb_finding_binding_start_target(COORDINATOR_ENDPOINT,
-                                                   JOIN_WINDOW_SECS);
-            break;
-
-        case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: {
-            esp_zb_zdo_signal_device_annce_params_t *anc =
-                (esp_zb_zdo_signal_device_annce_params_t *)
-                    esp_zb_app_signal_get_params(p_sg_p);
-            commissioning_on_device_announce(anc->device_short_addr, anc->ieee_addr);
-            break;
-        }
-
-        case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
-            LAMP_LOGI("zb: permit-join status changed");
-            break;
-
-        default:
-            // Log every signal during commissioning so we can see what the
-            // button/bulb are doing during pairing handshakes.
-            LAMP_LOGI("zb: signal 0x%x status=0x%x", sig_type, err_status);
-            break;
-    }
-}
-
-// ── Zigbee action handler — for OnOff commands FROM the button ──────────────
-
-static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t cb_id,
-                                   const void *message) {
-    switch (cb_id) {
-        case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID: {
-            // Diagnostic only — press detection happens in the APS handler
-            // (which sees frames the OnOff command-vs-attribute path misses).
-            const esp_zb_zcl_set_attr_value_message_t *msg =
-                (const esp_zb_zcl_set_attr_value_message_t *)message;
-            LAMP_LOGI("zb: SET_ATTR cluster=0x%04x ep=%u attr=0x%04x",
-                      msg->info.cluster, msg->info.dst_endpoint, msg->attribute.id);
-            break;
-        }
-        case ESP_ZB_CORE_CMD_DISC_ATTR_RESP_CB_ID: {
-            const esp_zb_zcl_cmd_discover_attributes_resp_message_t *m =
-                (const esp_zb_zcl_cmd_discover_attributes_resp_message_t *)message;
-            LAMP_UI("disc-resp cluster=0x%04x complete=%d:",
-                    m->info.cluster, m->is_completed);
-            for (const esp_zb_zcl_disc_attr_variable_t *v = m->variables;
-                 v != NULL; v = v->next) {
-                LAMP_UI("  attr=0x%04x type=0x%02x", v->attr_id, v->data_type);
-            }
-            break;
-        }
-        case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID: {
-            const esp_zb_zcl_cmd_read_attr_resp_message_t *m =
-                (const esp_zb_zcl_cmd_read_attr_resp_message_t *)message;
-            esp_zb_zcl_read_attr_resp_variable_t *v = m->variables;
-            for (; v != NULL; v = v->next) {
-                char hex[33] = "(empty)";
-                if (v->attribute.data.value != NULL && v->attribute.data.size > 0) {
-                    uint16_t n = v->attribute.data.size;
-                    if (n > 16) n = 16;
-                    for (uint16_t i = 0; i < n; i++) {
-                        snprintf(&hex[i*2], 3, "%02x",
-                                 ((uint8_t *)v->attribute.data.value)[i]);
-                    }
-                }
-                LAMP_UI("read-attr-resp cluster=0x%04x attr=0x%04x status=%u data=%s",
-                        m->info.cluster, v->attribute.id, v->status, hex);
-            }
-            break;
-        }
-        default:
-            // Log every action callback we don't handle, so a paired-but-
-            // -unbound button still shows up in the log when pressed.
-            LAMP_LOGI("zb action: cb_id=0x%x (unhandled)", cb_id);
-            break;
-    }
-    return ESP_OK;
-}
-
-// ── Coordinator endpoint setup ──────────────────────────────────────────────
-
-static esp_zb_cluster_list_t *make_clusters(void) {
-    esp_zb_cluster_list_t *clusters = esp_zb_zcl_cluster_list_create();
-
-    esp_zb_basic_cluster_cfg_t basic_cfg = {
-        .zcl_version  = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
-        .power_source = 0x04,   // mains
-    };
-    esp_zb_cluster_list_add_basic_cluster(
-        clusters, esp_zb_basic_cluster_create(&basic_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
-    esp_zb_identify_cluster_cfg_t id_cfg = {
-        .identify_time = 0,
-    };
-    esp_zb_cluster_list_add_identify_cluster(
-        clusters, esp_zb_identify_cluster_create(&id_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
-    // OnOff server — what the button binds to and sends commands at.
-    esp_zb_on_off_cluster_cfg_t on_off_cfg = {
-        .on_off = 0,
-    };
-    esp_zb_cluster_list_add_on_off_cluster(
-        clusters, esp_zb_on_off_cluster_create(&on_off_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
-    // We also want OnOff/Level/Color client clusters so we can send to the bulb.
-    esp_zb_cluster_list_add_on_off_cluster(
-        clusters, esp_zb_on_off_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
-
-    // IAS Zone CLIENT cluster (the CIE side). This is mandatory: without it,
-    // ZBOSS's ZCL dispatcher walks the endpoint cluster list looking for
-    // 0x0500, fails to find it, and emits a Default Response with status
-    // UNSUP_CLUSTER_COMMAND for every Zone Status Change Notification we
-    // receive — which the 3RSB22BZ interprets as "wrong CIE" and triggers
-    // a network rejoin. See research.md §URGENT Finding 1.
-    esp_zb_cluster_list_add_ias_zone_cluster(
-        clusters, esp_zb_ias_zone_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
-
-    // NOTE: we deliberately do NOT register the OTA Upgrade server cluster.
-    // The ESP-Zigbee-SDK's OTA server implementation asserts when a Query
-    // Next Image Request arrives if no file is configured (zboss
-    // zcl_ota_upgrade_srv_commands.c:132). Instead we intercept OTA frames
-    // in zb_aps_indication and respond manually with NO_IMAGE_AVAILABLE.
-    return clusters;
-}
-
-static void zigbee_task(void *pv) {
-    (void)pv;
-
-    esp_zb_cfg_t zb_nwk_cfg = {
-        .esp_zb_role = ESP_ZB_DEVICE_TYPE_COORDINATOR,
-        .install_code_policy = false,
-        .nwk_cfg.zczr_cfg = { .max_children = 10 },
-    };
-    esp_zb_init(&zb_nwk_cfg);
-
-    esp_zb_endpoint_config_t ep_cfg = {
-        .endpoint = COORDINATOR_ENDPOINT,
-        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
-        .app_device_version = 0,
-    };
-
-    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
-    esp_zb_ep_list_add_ep(ep_list, make_clusters(), ep_cfg);
-    esp_zb_device_register(ep_list);
-
-    esp_zb_core_action_handler_register(zb_action_handler);
-    esp_zb_aps_data_indication_handler_register(zb_aps_indication);
-
-    // ── CRITICAL fixes per research2.md ────────────────────────────────────
-    // Default end-device aging timeout on the coordinator side is 10 SECONDS
-    // (ESP_ZB_ED_AGING_TIMEOUT_10SEC). With nothing else changed, the
-    // coordinator silently evicts a sleepy child after 10 s of no useful
-    // keepalive, which is exactly what causes the 14.5 s leave loop we
-    // were chasing. Bump to 64 minutes.
-    esp_zb_nwk_set_ed_timeout(ESP_ZB_ED_AGING_TIMEOUT_64MIN);
-
-    // Disable the requirement that joining devices complete a Trust Center
-    // link-key exchange. ESP-Zigbee SDK issue #21 identified this as the
-    // cause of "coordinator sends Leave after association" for non-Z3
-    // devices. Many older ZB3.0 sensors (including some Third Reality
-    // firmware revisions) don't complete the new TCLK exchange cleanly.
-    esp_zb_secur_link_key_exchange_required_set(false);
-
-    ESP_ERROR_CHECK(esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK));
-    ESP_ERROR_CHECK(esp_zb_start(false));
-    esp_zb_stack_main_loop();
-}
-
 // ── Boot ────────────────────────────────────────────────────────────────────
 
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
-    log_init();
-    log_drainer_start();   // LAMP_UI now flows through a queue, not direct printf
 
-    LAMP_LOGI("─── lamp boot ───");
+    log_init();
+    log_drainer_start();   // LAMP_UI now flows through a queue, not direct printf.
 
     schedule_init();
     rtc_init();
@@ -513,20 +120,10 @@ void app_main(void) {
     ui_banner();
 
     console_init();
+    zigbee_start();
 
-    // Zigbee platform config — native radio on the C6.
-    esp_zb_platform_config_t platform = {
-        .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
-        .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
-    };
-    ESP_ERROR_CHECK(esp_zb_platform_config(&platform));
-
-    xTaskCreate(zigbee_task,        "zb",       4096, NULL, 5, NULL);
-    xTaskCreate(boundary_task,      "boundary", 2048, NULL, 4, NULL);
-    // Press dispatch task at priority 6 (above the Zigbee task) so a press
-    // pulls the Zigbee lock as soon as ZBOSS releases it. State machine and
-    // bulb commands run here, off the APS callback's critical path.
-    xTaskCreate(press_dispatch_task, "press",   4096, NULL, 6, &s_press_task);
+    xTaskCreate(boundary_task,       "boundary", 2048, NULL, 4, NULL);
+    xTaskCreate(press_dispatch_task, "press",    4096, NULL, 6, &s_press_task);
 
     LAMP_LOGI("─── boot complete ───");
 }
