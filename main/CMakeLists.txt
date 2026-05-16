@@ -6,6 +6,7 @@ idf_component_register(
         "bulb.c"
         "button.c"
         "commissioning.c"
+        "enrollment.c"
         "rtc.c"
         "console.c"
         "log.c"

@@ -11,9 +11,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
-// Defined in main.c — pushes the (CIE-address-write, unsolicited-enroll-
-// response) sequence for the 3RSB22BZ IAS Zone enrollment dance.
-extern void start_ias_enrollment(uint16_t short_addr);
+#include "enrollment.h"
 
 #define NVS_NAMESPACE     "lamp"
 #define NVS_KEY_BTN_IEEE  "btn_ieee"

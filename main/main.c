@@ -19,6 +19,7 @@
 #include "button.h"
 #include "commissioning.h"
 #include "console.h"
+#include "enrollment.h"
 #include "log.h"
 #include "rtc.h"
 #include "schedule.h"
@@ -53,7 +54,6 @@ static void retry_form_network(uint8_t mode) {
 // motion-sensor-style dwell. After the mode-switch gesture (5 quick
 // taps on the reset button) the button uses Multistate Input instead.
 #define IAS_ZONE_CLUSTER             0x0500
-#define IAS_ZONE_ATTR_CIE_ADDR       0x0010
 #define IAS_ZONE_CMD_STATUS_CHANGE   0x00
 #define IAS_ZONE_CMD_ENROLL_REQUEST  0x01
 
@@ -67,13 +67,12 @@ static void retry_form_network(uint8_t mode) {
 #define MULTISTATE_VALUE_SINGLE      0x0001
 
 // OTA Upgrade cluster (0x0019). The 3RSB22BZ periodically asks "do you
-// have an image for me?" If we don't respond it issues NWK_LEAVE within
-// seconds. The proper response is Query Next Image Response with status
-// 0x98 NO_IMAGE_AVAILABLE.
+// have an image for me?" — Query Next Image Request. We intentionally
+// suppress these by returning true from the APS callback, so ZBOSS doesn't
+// auto-reply with UNSUP_CLUSTER_COMMAND. The button does not require a
+// response to remain stable (verified once the aging-timeout fix landed).
 #define OTA_CLUSTER                  0x0019
 #define OTA_CMD_QUERY_NEXT_IMAGE_REQ 0x01
-#define OTA_CMD_QUERY_NEXT_IMAGE_RSP 0x02
-#define OTA_STATUS_NO_IMAGE_AVAILABLE 0x98
 
 // Frame dedup ring. APS retries re-use the original ZCL TSN, so a tuple of
 // (src_short, cluster, cmd, tsn) uniquely identifies a logical frame
@@ -104,230 +103,8 @@ static bool frame_is_duplicate(uint16_t src, uint16_t cluster, uint8_t cmd, uint
     return false;
 }
 
-// ── IAS Zone auto-enrollment ────────────────────────────────────────────────
-// Per zigbee-herdsman's canonical flow (controller/model/device.ts:1049-1093):
-// after the device joins, the coordinator writes its own IEEE into the
-// device's IAS_CIE_Address attribute, waits ~500 ms, then sends an
-// unsolicited Zone Enroll Response. We additionally still reply to any
-// runtime Zone Enroll Request frames (Trip-to-Pair flow).
-
-static uint16_t s_enroll_target_short = 0xFFFE;
-static esp_zb_ieee_addr_t s_coord_ieee_storage;
-
-static void do_cie_address_write(uint8_t arg) {
-    (void)arg;
-    if (s_enroll_target_short == 0xFFFE) return;
-    esp_zb_get_long_address(s_coord_ieee_storage);
-    esp_zb_zcl_attribute_t attr = {
-        .id = IAS_ZONE_ATTR_CIE_ADDR,
-        .data = {
-            .type  = ESP_ZB_ZCL_ATTR_TYPE_IEEE_ADDR,
-            .size  = 8,
-            .value = s_coord_ieee_storage,
-        },
-    };
-    esp_zb_zcl_write_attr_cmd_t cmd = {0};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = s_enroll_target_short;
-    cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
-    cmd.address_mode               = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.clusterID                  = IAS_ZONE_CLUSTER;
-    cmd.attr_number                = 1;
-    cmd.attr_field                 = &attr;
-    esp_zb_zcl_write_attr_cmd_req(&cmd);
-    LAMP_LOGI("ias zone: wrote CIE address to 0x%04x", s_enroll_target_short);
-}
-
-// Raw-byte Enroll Response. We construct the ZCL frame manually because
-// every higher-level SDK helper we tried for IAS Zone Enroll Response
-// produces a frame the 3RSB22BZ rejects (zoneState stays 0 even when CIE
-// address verifies as ours). Bytes per ZCL §8.2 Enroll Response (cmd 0x00):
-//
-//   Byte 0: Frame Control = 0x19
-//             bits 1:0 = 01 (cluster-specific command)
-//             bit  2   = 0  (not manufacturer-specific)
-//             bit  3   = 1  (server-to-client direction)
-//             bit  4   = 1  (disable default response)
-//   Byte 1: TSN
-//   Byte 2: Command ID = 0x00 (Enroll Response)
-//   Byte 3: enroll_response_code = 0x00 (SUCCESS)
-//   Byte 4: zone_id = 0x17 (23, matches zigbee-herdsman)
-static uint8_t s_enroll_tsn = 0x42;
-
-static void send_enroll_response(uint16_t short_addr, uint8_t endpoint) {
-    static uint8_t frame[5];
-    frame[0] = 0x19;          // FC
-    frame[1] = s_enroll_tsn++;
-    frame[2] = 0x00;          // cmd: Enroll Response
-    frame[3] = 0x00;          // enroll_response_code: SUCCESS
-    frame[4] = 0x17;          // zone_id: 23
-    esp_zb_apsde_data_req_t req = {0};
-    req.dst_addr_mode  = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    req.dst_addr.addr_short = short_addr;
-    req.dst_endpoint   = endpoint;
-    req.profile_id     = 0x0104;
-    req.cluster_id     = IAS_ZONE_CLUSTER;
-    req.src_endpoint   = COORDINATOR_ENDPOINT;
-    req.asdu_length    = sizeof(frame);
-    req.asdu           = frame;
-    req.tx_options     = ESP_ZB_APSDE_TX_OPT_ACK_TX;
-    req.radius         = 0;
-    esp_zb_aps_data_request(&req);
-    LAMP_LOGI("ias zone: sent enroll response (raw 5B) to 0x%04x ep=%u tsn=%u",
-              short_addr, endpoint, (unsigned)frame[1]);
-}
-
-static void do_unsolicited_enroll(uint8_t arg) {
-    (void)arg;
-    if (s_enroll_target_short == 0xFFFE) return;
-    send_enroll_response(s_enroll_target_short, 1);
-}
-
-// Read back zoneState (0x0000) AND iasCieAddr (0x0010) from the button's
-// IAS Zone cluster. Result arrives via the action handler as
-// ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID. If iasCieAddr doesn't equal our
-// own IEEE, our CIE write never stuck and that's why enrollment fails.
-static void do_read_zone_state(uint8_t arg) {
-    (void)arg;
-    if (s_enroll_target_short == 0xFFFE) return;
-    static uint16_t attr_ids[2] = { 0x0000, 0x0010 };  // ZoneState, IAS_CIE_Address
-    esp_zb_zcl_read_attr_cmd_t cmd = {0};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = s_enroll_target_short;
-    cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
-    cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.clusterID    = IAS_ZONE_CLUSTER;
-    cmd.attr_number  = 2;
-    cmd.attr_field   = attr_ids;
-    esp_zb_zcl_read_attr_cmd_req(&cmd);
-    LAMP_LOGI("ias zone: reading zoneState + CIE addr from 0x%04x",
-              s_enroll_target_short);
-}
-
-// Disable the 3RSB22BZ's double-click detection. The button defaults to a
-// ~1.5 s window after each press to see if a second press follows, which is
-// what makes a single tap take ~2 s end-to-end. Writing cancelDoubleClick=1
-// to the manufacturer-specific cluster 0xFF01 (mfg code 0x1233) tells the
-// button to fire single presses instantly. Discovered in the user-story
-// 3RSB22BZ Third Reality attribute table (also at zigbee-herdsman-converters
-// src/devices/third_reality.ts:737-746).
-#define TR_PRIVATE_CLUSTER     0xFF01
-#define TR_PRIVATE_MFG_CODE    0x1233
-#define TR_CANCEL_DOUBLECLICK  0x0000
-static uint8_t s_cancel_dbl_value = 1;
-
-static void do_disable_double_click(uint8_t arg) {
-    (void)arg;
-    if (s_enroll_target_short == 0xFFFE) return;
-    esp_zb_zcl_attribute_t attr = {
-        .id = TR_CANCEL_DOUBLECLICK,
-        .data = {
-            .type  = ESP_ZB_ZCL_ATTR_TYPE_U8,
-            .size  = 1,
-            .value = &s_cancel_dbl_value,
-        },
-    };
-    esp_zb_zcl_write_attr_cmd_t cmd = {0};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = s_enroll_target_short;
-    cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
-    cmd.address_mode               = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.clusterID                  = TR_PRIVATE_CLUSTER;
-    cmd.manuf_specific             = 1;
-    cmd.manuf_code                 = TR_PRIVATE_MFG_CODE;
-    cmd.attr_number                = 1;
-    cmd.attr_field                 = &attr;
-    esp_zb_zcl_write_attr_cmd_req(&cmd);
-    LAMP_LOGI("3R: disabled double-click on 0x%04x", s_enroll_target_short);
-}
-
-// Read back the cancelDoubleClick attribute to confirm the button actually
-// supports it. If status != 0, the cluster/attribute don't exist on this
-// firmware revision — meaning the 2-second press latency is baked in.
-static void do_verify_double_click(uint8_t arg) {
-    (void)arg;
-    if (s_enroll_target_short == 0xFFFE) return;
-    static uint16_t attr_id = TR_CANCEL_DOUBLECLICK;
-    esp_zb_zcl_read_attr_cmd_t cmd = {0};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = s_enroll_target_short;
-    cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
-    cmd.address_mode  = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.clusterID     = TR_PRIVATE_CLUSTER;
-    cmd.manuf_specific = 1;
-    cmd.manuf_code    = TR_PRIVATE_MFG_CODE;
-    cmd.attr_number   = 1;
-    cmd.attr_field    = &attr_id;
-    esp_zb_zcl_read_attr_cmd_req(&cmd);
-    LAMP_LOGI("3R: reading cancelDoubleClick back from 0x%04x", s_enroll_target_short);
-}
-
-// Manually triggered (`discover` console command) attribute scan of the
-// button's cluster 0xFF01. Used to find what timing-related attributes the
-// firmware actually supports, when our blind cancelDoubleClick write returns
-// UNSUPPORTED_ATTRIBUTE.
-extern void discover_button_attrs(void);
-
-void discover_button_attrs(void) {
-    uint16_t target = button_short_addr();
-    if (!button_is_known() || target == 0xFFFE) {
-        LAMP_UI("discover: no button known (button_known=%d short=0x%04x)",
-                (int)button_is_known(), target);
-        return;
-    }
-    esp_zb_zcl_disc_attr_cmd_t cmd = {0};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = target;
-    cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
-    cmd.address_mode      = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.cluster_id        = TR_PRIVATE_CLUSTER;
-    cmd.manuf_specific    = 1;
-    cmd.manuf_code        = TR_PRIVATE_MFG_CODE;
-    cmd.start_attr_id     = 0x0000;
-    cmd.max_attr_number   = 32;
-    esp_zb_zcl_disc_attr_cmd_req(&cmd);
-    LAMP_UI("discover: sent (cluster=0xFF01 mfg=0x1233 start=0x0000 max=32)");
-}
-
-// Read the button's Basic cluster (0x0000) for ZCL version (0x0000),
-// applicationVersion (0x0001), softwareBuildID (0x4000), manuf (0x0004),
-// model (0x0005). The softwareBuildID is what tells us whether an OTA
-// upgrade is even possible (compare to latest known image).
-extern void read_button_basic(void);
-void read_button_basic(void) {
-    uint16_t target = button_short_addr();
-    if (!button_is_known() || target == 0xFFFE) {
-        LAMP_UI("read-basic: no button known");
-        return;
-    }
-    static uint16_t attrs[] = {0x0000, 0x0001, 0x0004, 0x0005, 0x4000};
-    esp_zb_zcl_read_attr_cmd_t cmd = {0};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = target;
-    cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
-    cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.clusterID    = 0x0000;  // Basic
-    cmd.attr_number  = sizeof(attrs) / sizeof(attrs[0]);
-    cmd.attr_field   = attrs;
-    esp_zb_zcl_read_attr_cmd_req(&cmd);
-    LAMP_UI("read-basic: sent (ZCL ver, app ver, manuf, model, swBuildID)");
-}
-
-// Public entry. Call once on each device-announce from the button.
-void start_ias_enrollment(uint16_t short_addr) {
-    s_enroll_target_short = short_addr;
-    LAMP_LOGI("ias zone: kicking off auto-enrollment for 0x%04x", short_addr);
-    esp_zb_scheduler_alarm(do_cie_address_write,       0,    0);
-    esp_zb_scheduler_alarm(do_unsolicited_enroll,      0,  500);
-    esp_zb_scheduler_alarm(do_disable_double_click,    0, 1000);
-    esp_zb_scheduler_alarm(do_verify_double_click,     0, 1500);
-    // Read zoneState at two checkpoints to disambiguate timing vs format:
-    //   t=2s  — right after our unsolicited response (early window)
-    //   t=8s  — well after the button's own enroll-request flow had time
-    //           to complete (late window). If both read 0, format is wrong.
-    esp_zb_scheduler_alarm(do_read_zone_state,     0, 2000);
-    esp_zb_scheduler_alarm(do_read_zone_state,     0, 8000);
-}
+// IAS Zone enrollment, cancelDoubleClick, and diagnostic readers live in
+// enrollment.c. The APS handler below dispatches to it.
 
 // Press dispatch:
 //   1) UI print and counter happen synchronously from the APS callback so the
@@ -362,48 +139,6 @@ static void on_button_press(void) {
     if (s_press_task != NULL) {
         xTaskNotifyGive(s_press_task);
     }
-}
-
-// Runtime reply to incoming Zone Enroll Request frames (Trip-to-Pair flow).
-// Stashed because send_enroll_response calls into the Zigbee stack and we
-// want to do it from the scheduler thread, not the APS callback.
-static uint16_t s_pending_enroll_addr = 0xFFFE;
-static uint8_t  s_pending_enroll_ep   = 1;
-
-static void deferred_enroll_response(uint8_t arg) {
-    (void)arg;
-    if (s_pending_enroll_addr == 0xFFFE) return;
-    send_enroll_response(s_pending_enroll_addr, s_pending_enroll_ep);
-    s_pending_enroll_addr = 0xFFFE;
-}
-
-// Reply to OTA Query Next Image Request with NO_IMAGE_AVAILABLE so the
-// button doesn't interpret the (otherwise UNSUP_CLUSTER) response as a
-// broken-network signal and issue NWK_LEAVE.
-static uint16_t s_pending_ota_addr = 0xFFFE;
-static uint8_t  s_pending_ota_ep   = 1;
-static uint8_t  s_ota_no_image_status = OTA_STATUS_NO_IMAGE_AVAILABLE;
-
-static void deferred_ota_no_image(uint8_t arg) {
-    (void)arg;
-    if (s_pending_ota_addr == 0xFFFE) return;
-    esp_zb_zcl_custom_cluster_cmd_t cmd = {0};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = s_pending_ota_addr;
-    cmd.zcl_basic_cmd.dst_endpoint = s_pending_ota_ep;
-    cmd.zcl_basic_cmd.src_endpoint = COORDINATOR_ENDPOINT;
-    cmd.address_mode               = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.profile_id                 = 0x0104;
-    cmd.cluster_id                 = OTA_CLUSTER;
-    cmd.direction                  = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
-    cmd.dis_default_resp           = 1;
-    cmd.custom_cmd_id              = OTA_CMD_QUERY_NEXT_IMAGE_RSP;
-    cmd.data.type                  = ESP_ZB_ZCL_ATTR_TYPE_U8;
-    cmd.data.size                  = 1;
-    cmd.data.value                 = &s_ota_no_image_status;
-    esp_zb_zcl_custom_cluster_cmd_resp(&cmd);
-    LAMP_LOGI("ota: replied NO_IMAGE_AVAILABLE to 0x%04x ep=%u",
-              s_pending_ota_addr, s_pending_ota_ep);
-    s_pending_ota_addr = 0xFFFE;
 }
 
 static bool zb_aps_indication(esp_zb_apsde_data_ind_t ind) {
@@ -500,17 +235,16 @@ static bool zb_aps_indication(esp_zb_apsde_data_ind_t ind) {
     if (cluster_specific &&
         ind.cluster_id == IAS_ZONE_CLUSTER &&
         cmd_id == IAS_ZONE_CMD_ENROLL_REQUEST) {
-        s_pending_enroll_addr = ind.src_short_addr;
-        s_pending_enroll_ep   = ind.src_endpoint;
-        esp_zb_scheduler_alarm(deferred_enroll_response, 0, 0);
+        enrollment_handle_enroll_request(ind.src_short_addr, ind.src_endpoint);
     }
     if (cluster_specific &&
         ind.cluster_id == OTA_CLUSTER &&
         cmd_id == OTA_CMD_QUERY_NEXT_IMAGE_REQ) {
-        // TEST A: do NOT proactively respond. Just suppress ZBOSS's
-        // UNSUP_CLUSTER default response. If the button still leaves at
-        // +4s, OTA reply isn't the cause.
-        LAMP_LOGI("ota: query received, no response sent (Test A)");
+        // Suppress ZBOSS's default UNSUP_CLUSTER_COMMAND reply. We don't
+        // run an OTA server, and the button is happy to keep getting no
+        // reply (verified — the leave loop was the aging-timeout default,
+        // not unanswered OTA queries).
+        LAMP_LOGI("ota: query suppressed");
         return true;
     }
     return false;  // let the stack process normally otherwise

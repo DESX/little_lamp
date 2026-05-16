@@ -102,6 +102,11 @@ set-time:
 erase-nvs:
 	$(IDF_RUN) -B $(BUILD_DIR) -p $(SERIAL_PORT) erase-flash
 
+## test — run host-side unit tests (no hardware needed)
+.PHONY: test
+test:
+	$(MAKE) -C tests/unit
+
 ## clean — remove firmware build artifacts (keeps cached ESP-IDF)
 clean:
 	rm -rf $(BUILD_DIR)

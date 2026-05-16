@@ -102,7 +102,7 @@ static void send_color_xy(uint16_t x, uint16_t y, uint16_t transition_tenths) {
 }
 
 void bulb_command_on_warm(uint16_t transition_tenths) {
-    if (!s_known) { LAMP_LOGW("bulb: ON skipped — bulb not paired"); return; }
+    if (!s_known) { LAMP_UI("bulb: ON skipped — bulb not paired"); return; }
     int sent = 0;
     if (s_last_color != BULB_COLOR_WARM) {
         send_color_temp(COLOR_TEMP_WARM_MIREDS, transition_tenths);
@@ -125,7 +125,7 @@ void bulb_command_on_warm(uint16_t transition_tenths) {
 
 void bulb_command_off(uint16_t transition_tenths) {
     (void)transition_tenths;
-    if (!s_known) { LAMP_LOGW("bulb: OFF skipped — bulb not paired"); return; }
+    if (!s_known) { LAMP_UI("bulb: OFF skipped — bulb not paired"); return; }
     if (s_last_on) {
         send_on_off(false);
         s_last_on = false;
@@ -136,7 +136,7 @@ void bulb_command_off(uint16_t transition_tenths) {
 }
 
 void bulb_command_dim_red(uint16_t transition_tenths) {
-    if (!s_known) { LAMP_LOGW("bulb: DIM-RED skipped — bulb not paired"); return; }
+    if (!s_known) { LAMP_UI("bulb: DIM-RED skipped — bulb not paired"); return; }
     int sent = 0;
     if (s_last_color != BULB_COLOR_RED) {
         send_color_xy(COLOR_X_RED, COLOR_Y_RED, transition_tenths);

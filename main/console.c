@@ -70,8 +70,7 @@ static int cmd_pair(int argc, char **argv) {
     return 0;
 }
 
-extern void discover_button_attrs(void);
-extern void read_button_basic(void);
+#include "enrollment.h"
 
 static int cmd_discover(int argc, char **argv) {
     (void)argc; (void)argv;

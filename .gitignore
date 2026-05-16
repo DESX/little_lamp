@@ -14,6 +14,10 @@ managed_components/
 sdkconfig
 sdkconfig.old
 
+# Unit test binaries (built by tests/unit/Makefile)
+tests/unit/test_*
+!tests/unit/test_*.c
+
 # Editor / tooling
 .vscode/
 .idea/
