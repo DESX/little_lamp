@@ -5,16 +5,12 @@
 
 #include "log.h"
 
-// Constants from USER_STORY.md
-#define LEVEL_ON                254
-#define LEVEL_NIGHT             5
-#define COLOR_TEMP_WARM_MIREDS  370
-#define COLOR_X_RED             ((uint16_t)(0.675 * 65535))
-#define COLOR_Y_RED             ((uint16_t)(0.322 * 65535))
+// Protocol mechanic — which endpoint on us speaks to the bulb. Stays
+// in the helper because changing it doesn't change observable behavior.
+#define COORDINATOR_EP  1
 
-#define COORDINATOR_EP          1
-
-void bulb_init(bulb_t *b) {
+void bulb_init(bulb_t *b, const bulb_config_t *config) {
+    b->config     = *config;
     b->short_addr = 0xFFFE;
     b->endpoint   = 0;
     b->known      = false;
@@ -89,13 +85,13 @@ void bulb_command_on_warm(bulb_t *b, uint16_t transition_tenths) {
     if (!b->known) { LAMP_UI("bulb: ON skipped — bulb not paired"); return; }
     int sent = 0;
     if (b->last_color != BULB_COLOR_WARM) {
-        send_color_temp(b, COLOR_TEMP_WARM_MIREDS, transition_tenths);
+        send_color_temp(b, b->config.color_temp_warm_mireds, transition_tenths);
         b->last_color = BULB_COLOR_WARM;
         sent++;
     }
-    if (b->last_level != LEVEL_ON) {
-        send_level(b, LEVEL_ON, transition_tenths);
-        b->last_level = LEVEL_ON;
+    if (b->last_level != b->config.level_on) {
+        send_level(b, b->config.level_on, transition_tenths);
+        b->last_level = b->config.level_on;
         sent++;
     }
     if (!b->last_on) {
@@ -104,7 +100,7 @@ void bulb_command_on_warm(bulb_t *b, uint16_t transition_tenths) {
         sent++;
     }
     LAMP_LOGI("bulb: ON warm-white, level=%u (sent %d cmd%s)",
-              LEVEL_ON, sent, sent == 1 ? "" : "s");
+              b->config.level_on, sent, sent == 1 ? "" : "s");
 }
 
 void bulb_command_off(bulb_t *b, uint16_t transition_tenths) {
@@ -123,13 +119,13 @@ void bulb_command_dim_red(bulb_t *b, uint16_t transition_tenths) {
     if (!b->known) { LAMP_UI("bulb: DIM-RED skipped — bulb not paired"); return; }
     int sent = 0;
     if (b->last_color != BULB_COLOR_RED) {
-        send_color_xy(b, COLOR_X_RED, COLOR_Y_RED, transition_tenths);
+        send_color_xy(b, b->config.color_x_red, b->config.color_y_red, transition_tenths);
         b->last_color = BULB_COLOR_RED;
         sent++;
     }
-    if (b->last_level != LEVEL_NIGHT) {
-        send_level(b, LEVEL_NIGHT, transition_tenths);
-        b->last_level = LEVEL_NIGHT;
+    if (b->last_level != b->config.level_night) {
+        send_level(b, b->config.level_night, transition_tenths);
+        b->last_level = b->config.level_night;
         sent++;
     }
     if (!b->last_on) {
@@ -138,5 +134,5 @@ void bulb_command_dim_red(bulb_t *b, uint16_t transition_tenths) {
         sent++;
     }
     LAMP_LOGI("bulb: dim red, level=%u (sent %d cmd%s)",
-              LEVEL_NIGHT, sent, sent == 1 ? "" : "s");
+              b->config.level_night, sent, sent == 1 ? "" : "s");
 }

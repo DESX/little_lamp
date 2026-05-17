@@ -7,6 +7,7 @@
 #include "bulb.h"
 #include "button.h"
 #include "commissioning.h"
+#include "configuration.h"
 #include "console.h"
 #include "log.h"
 #include "rtc.h"
@@ -24,6 +25,17 @@ static commissioning_t  g_commissioning;
 
 static uint32_t      g_press_count = 0;
 static TaskHandle_t  g_press_task  = NULL;
+
+// What the bulb does at each behavioral setting. Source values are
+// LAMP_BULB_* in configuration.h; assembled here so the wiring stays
+// visible from app_main.
+static const bulb_config_t g_bulb_config = {
+    .level_on               = LAMP_BULB_LEVEL_ON,
+    .level_night            = LAMP_BULB_LEVEL_NIGHT,
+    .color_temp_warm_mireds = LAMP_BULB_WARM_MIREDS,
+    .color_x_red            = LAMP_BULB_RED_X,
+    .color_y_red            = LAMP_BULB_RED_Y,
+};
 
 // ── Status banner ───────────────────────────────────────────────────────────
 
@@ -83,17 +95,17 @@ void app_main(void) {
     log_init(&g_log);
     log_drainer_start(&g_log);
 
-    schedule_init();
+    schedule_init(LAMP_TIMEZONE, LAMP_NIGHT_START_MIN, LAMP_NIGHT_END_MIN);
     rtc_init();
-    bulb_init(&g_bulb);
+    bulb_init(&g_bulb, &g_bulb_config);
     button_init(&g_button);
-    state_init(&g_state);
+    state_init(&g_state, LAMP_PRESS_TRANSITION_TENTHS, LAMP_BOUNDARY_TRANSITION_TENTHS);
     commissioning_init(&g_commissioning, &g_button, &g_bulb, show_status_banner);
 
     show_status_banner();
 
     console_init(&g_log, &g_commissioning, &g_button);
-    zigbee_start(&g_commissioning);
+    zigbee_start(&g_commissioning, LAMP_JOIN_WINDOW_SECS);
 
     xTaskCreate(boundary_task,       "boundary", 2048, NULL, 4, NULL);
     xTaskCreate(press_dispatch_task, "press",    4096, NULL, 6, &g_press_task);

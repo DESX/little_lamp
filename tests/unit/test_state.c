@@ -29,8 +29,9 @@ static time_t local_epoch(int year, int mo, int d, int h, int mi) {
 }
 
 static void fresh(state_machine_t *s, bulb_t *b) {
-    state_init(s);
-    bulb_init(b);
+    schedule_init("EST5EDT,M3.2.0,M11.1.0", 19*60 + 30, 6*60 + 40);
+    state_init(s, 0, 0);
+    bulb_init(b, NULL);
 }
 
 static void test_first_press_during_day(void) {
@@ -79,7 +80,7 @@ static void test_boundary_when_on_does_nothing(void) {
     rtc_set(local_epoch(2026, 1, 15, 22, 0));
     state_handle_button_press(&s, &b);          // -> ON, on-warm
     ASSERT(bulb_stub_last_call == BULB_STUB_ON_WARM, "ON should emit on-warm");
-    bulb_init(&b);                              // reset call tracking
+    bulb_init(&b, NULL);                        // reset call tracking
     state_handle_boundary_cross(&s, &b);
     ASSERT(bulb_stub_call_count == 0, "boundary while ON must not touch the bulb");
 }

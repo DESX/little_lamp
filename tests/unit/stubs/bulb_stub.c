@@ -7,8 +7,8 @@
 bulb_stub_call_t bulb_stub_last_call  = BULB_STUB_NONE;
 int              bulb_stub_call_count = 0;
 
-void bulb_init(bulb_t *b) {
-    (void)b;
+void bulb_init(bulb_t *b, const bulb_config_t *config) {
+    (void)b; (void)config;
     bulb_stub_last_call  = BULB_STUB_NONE;
     bulb_stub_call_count = 0;
 }

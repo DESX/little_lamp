@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "commissioning.h"
 
 // zb owns the connection to ZBOSS / ESP-Zigbee SDK. The SDK keeps its
@@ -9,12 +11,12 @@
 // exception; the storage itself still lives in main.
 //
 // Application contract:
-//   - main calls zigbee_start(&commissioning) once at boot.
+//   - main calls zigbee_start(&commissioning, join_window_secs) once at boot.
 //   - zb fires on_button_press_event() (declared below, defined in
 //     main) whenever a frame classified as a button press arrives.
 //   - everything else (frame parsing, signal dispatch, cluster
 //     registration, vendor quirks) is private to zb.c.
-void zigbee_start(commissioning_t *commissioning);
+void zigbee_start(commissioning_t *commissioning, uint16_t join_window_secs);
 
 // Implemented in main.
 void on_button_press_event(void);

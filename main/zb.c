@@ -8,6 +8,7 @@
 #include "aps/esp_zigbee_aps.h"
 #include "test/esp_zigbee_test_utils.h"  // esp_zb_nwk_set_ed_timeout
 #include "esp_zigbee_secur.h"
+#include "esp_pm.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,15 +19,16 @@
 
 // SDK exception: ESP-Zigbee SDK invokes esp_zb_app_signal_handler and
 // the APS/action callbacks by symbol name; no user-data pointer is
-// threaded through. We stash the application's commissioning_t at
-// zigbee_start time and reach into it from those callbacks. Storage
-// lives in main; this is a cached pointer.
-static commissioning_t *s_commissioning = NULL;
+// threaded through. We stash the application's commissioning_t and the
+// join-window duration (configured from main) at zigbee_start time and
+// reach into them from those callbacks. Storage for the pointed-to
+// objects lives in main.
+static commissioning_t *s_commissioning    = NULL;
+static uint16_t         s_join_window_secs = 0;
 
-// ── Tuning knobs ────────────────────────────────────────────────────────────
+// ── Protocol mechanics (not behavior) ───────────────────────────────────────
 
 #define COORDINATOR_ENDPOINT    1
-#define JOIN_WINDOW_SECS        180
 
 // Pin to Zigbee channel 25 (2475 MHz). Sits above Wi-Fi 2.4 GHz channels
 // 1/6/11, so it avoids the worst of Wi-Fi interference. To scan all
@@ -194,10 +196,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                 LAMP_LOGI("zb: rebooted into existing network");
                 if (!commissioning_complete(s_commissioning)) {
                     LAMP_LOGI("zb: opening join window (%ds) + F&B target",
-                              JOIN_WINDOW_SECS);
-                    esp_zb_bdb_open_network(JOIN_WINDOW_SECS);
+                              s_join_window_secs);
+                    esp_zb_bdb_open_network(s_join_window_secs);
                     esp_zb_bdb_finding_binding_start_target(COORDINATOR_ENDPOINT,
-                                                            JOIN_WINDOW_SECS);
+                                                            s_join_window_secs);
                 }
             } else {
                 LAMP_LOGE("zb: reboot failed (0x%x), restarting commissioning", err_status);
@@ -221,10 +223,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
 
         case ESP_ZB_BDB_SIGNAL_STEERING:
             LAMP_LOGI("zb: steering done, opening join window (%ds) + F&B target",
-                      JOIN_WINDOW_SECS);
-            esp_zb_bdb_open_network(JOIN_WINDOW_SECS);
+                      s_join_window_secs);
+            esp_zb_bdb_open_network(s_join_window_secs);
             esp_zb_bdb_finding_binding_start_target(COORDINATOR_ENDPOINT,
-                                                   JOIN_WINDOW_SECS);
+                                                   s_join_window_secs);
             break;
 
         case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: {
@@ -378,8 +380,22 @@ static void zigbee_task(void *pv) {
     esp_zb_stack_main_loop();
 }
 
-void zigbee_start(commissioning_t *commissioning) {
-    s_commissioning = commissioning;
+void zigbee_start(commissioning_t *commissioning, uint16_t join_window_secs) {
+    s_commissioning    = commissioning;
+    s_join_window_secs = join_window_secs;
+
+    // Power management. Light sleep between interrupts is the biggest
+    // win available without breaking our always-on coordinator role:
+    // the 802.15.4 radio's clock domain has its own PM locks (managed
+    // by the SDK) so the radio keeps listening while the rest of the
+    // chip drops to deep idle.
+    esp_pm_config_t pm = {
+        .max_freq_mhz       = 160,
+        .min_freq_mhz       = 80,
+        .light_sleep_enable = true,
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&pm));
+
     esp_zb_platform_config_t platform = {
         .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
         .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },

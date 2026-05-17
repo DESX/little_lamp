@@ -270,6 +270,73 @@ module holds the file-static state as a necessary evil; we still
 state to act on. Document the deviation in the helper's source — once,
 at the top, plainly.
 
+### Resources flow through main
+
+A *resource* is anything the system uses: hardware (the bulb, the
+button, the radio), utilities (the logger, the console, the queue), and
+configuration (the timezone, the brightness values, the schedule). The
+resources don't all have to be **defined** in `main.c`, but they must
+all **flow through** `main.c` visibly. Allocation, configuration, and
+wiring are main's job to show; the heavy lifting can live elsewhere.
+
+The reader of `main.c` should be able to answer two questions for any
+resource:
+
+1. *Where does it live?* (a struct allocated in main, or a function
+   pointer registered from main)
+2. *How is it configured?* (a parameter passed from main, or a named
+   constant declared in main / `configuration.h`)
+
+#### Configuration is a resource
+
+Behavioral parameters — values whose effect an observer of the running
+system would notice — are themselves a resource and follow the same
+rule. The night-window start (19:30), the timezone (`EST5EDT,...`), the
+warm-white color temperature (2700 K), the night-light brightness (2%)
+all describe *what the system does*. They belong in main's field of
+view, not buried as `#define`s inside helper files.
+
+Two ways to keep configuration in main's view:
+
+- **Small projects**: declare the values as named constants at the top
+  of `main.c`. A reader scrolling to the top sees the whole spec.
+- **Larger projects**: put them in a single header conventionally named
+  `configuration.h` (or `config.h`), included at the top of `main.c`.
+  The `#include` is the signpost — it tells the reader "this is where
+  the tuning knobs live, all of them, one file."
+
+The philosophy is unchanged at either size. What changes is where the
+values live; what stays constant is the **one-step traceability**
+from main to wherever the config is. A reader never has to guess which
+of six helper files holds a particular constant.
+
+#### What stays in helpers (mechanics)
+
+Values that describe *how* we speak a protocol or manage an internal
+data structure are mechanics, not behavior. They stay in the helper:
+cluster IDs, frame layouts, retry counts, ring buffer sizes, scheduler
+priorities. The dividing test is the conversation test — would you
+mention this number when explaining the system to its owner? If yes
+("warm light comes on at 100% brightness, dim red at 2% during night
+hours") it's behavior. If no ("the dedup ring holds eight entries") it
+is mechanics.
+
+#### What this rules out
+
+- Behavior values living as `#define` constants inside helper modules.
+  `#define NIGHT_START_MIN (19*60+30)` in `schedule.c` is a violation
+  — a reader of main has no way to discover this matters.
+- "Smart defaults" baked into init functions with no way to override
+  from main. `schedule_init(void)` reading from a file-static config is
+  hidden; `schedule_init(tz, night_start_min, night_end_min)` is
+  visible.
+- Configuration that lives in NVS but has no compile-time default
+  visible in main. The current verbosity flag is borderline — it
+  defaults via `log_init` reading NVS; the default itself (false) is
+  baked into log.c. For now this is acceptable because the user can
+  set it explicitly via the console; a strict reading of the rule
+  would lift the default into configuration.h too.
+
 ## Single-click direct manipulation
 
 In the CMS UI, every action is a single click on a visible target. No

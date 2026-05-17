@@ -36,7 +36,7 @@ static time_t local_epoch(int year, int month, int day, int hour, int minute) {
 }
 
 static void test_is_night_boundaries(void) {
-    schedule_init();
+    schedule_init("EST5EDT,M3.2.0,M11.1.0", 19*60 + 30, 6*60 + 40);
     // Pick a winter date (no DST ambiguity) for stable boundaries.
 
     // 06:39 = night (still inside the dark window).
@@ -56,7 +56,7 @@ static void test_is_night_boundaries(void) {
 }
 
 static void test_next_boundary_during_day(void) {
-    schedule_init();
+    schedule_init("EST5EDT,M3.2.0,M11.1.0", 19*60 + 30, 6*60 + 40);
     time_t now = local_epoch(2026, 1, 15, 12, 0);  // noon
     time_t next = schedule_next_boundary(now);
     // Next boundary is today at 19:30.
@@ -65,7 +65,7 @@ static void test_next_boundary_during_day(void) {
 }
 
 static void test_next_boundary_during_evening_night(void) {
-    schedule_init();
+    schedule_init("EST5EDT,M3.2.0,M11.1.0", 19*60 + 30, 6*60 + 40);
     time_t now = local_epoch(2026, 1, 15, 20, 0);  // 20:00, in night
     time_t next = schedule_next_boundary(now);
     // Next boundary is tomorrow at 06:40.
@@ -74,7 +74,7 @@ static void test_next_boundary_during_evening_night(void) {
 }
 
 static void test_next_boundary_during_early_morning_night(void) {
-    schedule_init();
+    schedule_init("EST5EDT,M3.2.0,M11.1.0", 19*60 + 30, 6*60 + 40);
     time_t now = local_epoch(2026, 1, 15, 3, 0);  // 03:00, still night
     time_t next = schedule_next_boundary(now);
     // Next boundary is today at 06:40.
