@@ -298,8 +298,23 @@ view, not buried as `#define`s inside helper files.
 
 Two ways to keep configuration in main's view:
 
-- **Small projects**: declare the values as named constants at the top
-  of `main.c`. A reader scrolling to the top sees the whole spec.
+- **Small projects**: declare the values at the top of `main.c`,
+  either as `#define`s or — preferred when there are more than a
+  handful — as `static const` structs grouped by responsibility. A
+  reader scrolling to the top sees the whole spec.
+
+  ```c
+  static const struct {
+      uint8_t  level_on;
+      uint8_t  level_night;
+      uint16_t warm_mireds;
+  } g_bulb_cfg = { .level_on = 254, .level_night = 5, .warm_mireds = 370 };
+  ```
+
+  Anonymous struct types keep the name space clean. Splitting into
+  one struct per subsystem (`g_schedule_cfg`, `g_bulb_cfg`,
+  `g_runtime_cfg`) keeps each group short and easy to scan.
+
 - **Larger projects**: put them in a single header conventionally named
   `configuration.h` (or `config.h`), included at the top of `main.c`.
   The `#include` is the signpost — it tells the reader "this is where
@@ -336,6 +351,59 @@ is mechanics.
   baked into log.c. For now this is acceptable because the user can
   set it explicitly via the console; a strict reading of the rule
   would lift the default into configuration.h too.
+
+### The user story lives in main; helpers are agnostic
+
+The hub — the scaffolding around the policy — should be reusable for
+any similar product. The user story — *what this specific product
+does* — should be visible in `main.c`, as code, in a single rendering
+function plus the events that call it. A reader of main.c sees the
+product description in executable form:
+
+```c
+// Got a button press → toggle state → render.
+// Schedule boundary fired → if OFF, re-render (day↔night affects OFF).
+static void render(lamp_state_t s, uint16_t transition_tenths) {
+    if (s == LAMP_STATE_ON) {
+        bulb_on_warm_white(&g_bulb, LAMP_BULB_LEVEL_ON,
+                           LAMP_BULB_WARM_MIREDS, transition_tenths);
+    } else if (schedule_is_night(rtc_now())) {
+        bulb_on_color_xy(&g_bulb, LAMP_BULB_LEVEL_NIGHT,
+                         LAMP_BULB_RED_X, LAMP_BULB_RED_Y, transition_tenths);
+    } else {
+        bulb_off(&g_bulb, transition_tenths);
+    }
+}
+```
+
+Six lines. That is the whole product. Anything you can see here, you
+can change by editing main. Anything you cannot see here, you should
+not be able to change by editing main — that's the helper's job.
+
+#### Helpers expose primitives, not policies
+
+The bulb helper knows how to "warm-white at level X, mireds Y" and
+"xy-colour at level X, point (Y, Z)" — generic primitives. It does
+**not** know that warm white means "on" or that xy red means
+"night-light." The schedule helper knows how to compute "is now inside
+the configured window" — a generic primitive. It does not know that
+the window means "night-mode" or what should be done when inside it.
+
+Main is the only place that composes primitives into policy. If a
+helper grows a function whose name encodes the user story
+(`bulb_command_dim_red`, `state_handle_button_press`), that helper is
+absorbing logic that belongs upstream — pull it back out.
+
+#### The rewrite test
+
+If the product description changes ("instead of dim red at night,
+flash blue twice every minute"), how many files do you touch?
+
+- One (`main.c`) — the policy is properly localised.
+- Two or three — the helpers are leaking user-story knowledge.
+
+The current shape passes this test. If a future change pulls policy
+back into a helper, push it out again.
 
 ## Single-click direct manipulation
 

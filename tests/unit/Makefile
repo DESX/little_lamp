@@ -14,8 +14,7 @@ all: $(TESTS)
 test_schedule: test_schedule.c ../../main/schedule.c
 	$(CC) $(CFLAGS) -o $@ $^
 
-test_state: test_state.c ../../main/state.c ../../main/schedule.c \
-            stubs/bulb_stub.c stubs/rtc_stub.c
+test_state: test_state.c ../../main/state.c
 	$(CC) $(CFLAGS) -o $@ $^
 
 clean:
